@@ -402,6 +402,10 @@ c_convert="/usr/local/bin/convert"
 c_identify="/usr/local/bin/identify"
 c_pdfinfo="/usr/local/bin/pdfinfo"
 c_lsof="/usr/sbin/lsof"
+# qpdf validates every object and stream; pdfinfo reads only the trailer,
+# catalog and page tree. A delivery whose CONTENT is damaged passes pdfinfo
+# and fails qpdf -- and OCRing it would waste a run and poison the queue.
+c_qpdf="/opt/homebrew/bin/qpdf"
 # -b -w: no blocking kernel calls, no warnings.  -n -P: no host/port lookups.
 # Without these lsof can hang for minutes on an unresponsive mount.
 c_lsof_opts="-b -w -n -P"
@@ -943,6 +947,29 @@ page_count() { # $1 = file
   printf '%s\n' "$_pc"
 }
 
+# The deep structural check, run once per delivery after it has settled.
+# qpdf grades its exit: 0 = clean, 3 = warnings only, 2 = real damage. Reading
+# any non-zero as damage would quarantine healthy documents over cosmetic
+# warnings, which plenty of real PDFs carry.
+deep_check_ok() { # $1 = file. 0 = usable, 1 = damaged
+  DEEP_CHECK_WHY=""
+  case "$(file --brief "$1" 2>/dev/null | cut -f1 -d' ')" in
+    PDF) ;;
+    *) return 0 ;;                       # pictures have no structure to check
+  esac
+  if [ -z "$c_qpdf" ] || [ ! -x "$c_qpdf" ]; then
+    DEEP_CHECK_WHY=""
+    vdet "no qpdf -- skipping the deep structural check"
+    return 0
+  fi
+  "$c_qpdf" --check "$1" >/dev/null 2>&1
+  case "$?" in
+    0) return 0 ;;
+    3) vdet "qpdf reports warnings (not damage) for '${1##*/}'"; return 0 ;;
+    *) DEEP_CHECK_WHY="qpdf reports damaged objects or streams"; return 1 ;;
+  esac
+}
+
 # Is this name one we never treat as a document?
 is_ignored_name() { # $1 = path
   _in_b="${1##*/}"
@@ -1337,6 +1364,19 @@ do_process() {
       continue
     fi
     pe "  >  settled ($(file_size "$S_INP") bytes) [0]"
+
+    # ONCE, now that the file has stopped changing -- 0.3s per document, and
+    # far too expensive to run inside settle's poll loop. This is the strong
+    # structural check: settle's parse test only proves pdfinfo can read the
+    # catalogue, not that the page content survived the transfer.
+    if ! deep_check_ok "$S_INP"; then
+      FAILED_CNT=$(( FAILED_CNT + 1 ))
+      T_PATH="$T_PATH_FAILED"; stage_file
+      T_PATH="$OCR_QUEUE_PATH"
+      notify_bad_delivery "$S_INP" "structurally damaged -- $DEEP_CHECK_WHY"
+      err 084 "'$S_INP' is structurally damaged ($DEEP_CHECK_WHY) -- filed under FAILED." "-"
+      continue
+    fi
     settle_backup "$S_INP"
 
     # 2. A light type check only. my-ocr does the deep validation -- it skips
@@ -2026,7 +2066,7 @@ setup_preflight() {
   if [ -d "$_act" ]; then det "OCR action     OK   $_act"
   else det "OCR action     MISSING at '$_act' -- the workflow's OCR step will not load"; _fail=1; fi
 
-  for _c in "$c_trash" "$c_convert" "$c_pdfinfo" "$c_lsof"; do
+  for _c in "$c_trash" "$c_convert" "$c_pdfinfo" "$c_qpdf" "$c_lsof"; do
     if [ -x "$_c" ]; then det "$(printf '%-14s' "${_c##*/}") OK   $_c"
     else det "$(printf '%-14s' "${_c##*/}") MISSING at '$_c'"; _fail=1; fi
   done
@@ -2667,7 +2707,7 @@ _EOSTUB_
   # arguments through a variable does not survive word splitting intact.
   _tsedf="$_tw/toolpaths.sed"
   : >"$_tsedf"
-  for _tk in trash convert identify pdfinfo lsof; do
+  for _tk in trash convert identify pdfinfo lsof qpdf; do
     _tv="$(command -v "$_tk" 2>/dev/null)"
     [ -z "$_tv" ] && [ -x "/LINKS/bin/$_tk" ] && _tv="/LINKS/bin/$_tk"
     [ -n "$_tv" ] && printf 's|^c_%s=.*|c_%s="%s"|\n' "$_tk" "$_tk" "$_tv" >>"$_tsedf"
@@ -2952,6 +2992,42 @@ t_cleanup() {
   fi
 }
 
+# ---- a structurally damaged delivery must not reach the OCR ---------------
+# settle's parse test only proves pdfinfo can read the catalogue. A file whose
+# CONTENT was damaged in transit passes that and fails qpdf -- and OCRing it
+# wastes a run and puts a corrupt document in the queue.
+t_deep_check() {
+  if ! command -v qpdf >/dev/null 2>&1 && [ ! -x /opt/homebrew/bin/qpdf ]; then
+    t_ok "deep check: skipped, no qpdf on this host"; return 0
+  fi
+  _d="$T_TMP/deep"; t_world "$_d"
+  t_pdf "$_d/whole.pdf"
+  # keep enough for pdfinfo to still read the trailer, but damage the body
+  _sz="$(wc -c <"$_d/whole.pdf" | tr -d ' ')"
+  dd if="$_d/whole.pdf" of="$_d/drop/damaged.pdf" bs=1 count=$(( _sz - 40 )) 2>/dev/null
+  printf 'trailer
+<< /Size 5 /Root 1 0 R >>
+startxref
+9
+%%%%EOF
+' >>"$_d/drop/damaged.pdf"
+  t_pdf "$_d/drop/healthy.pdf"
+
+  "$0" --config "$T_CONF" --settle-timeout 6 process --all >/dev/null 2>&1 </dev/null
+
+  if [ -n "$(find "$_d/done" -name '*healthy*' 2>/dev/null)" ]; then
+    t_ok "deep check: a healthy delivery still goes through"
+  else
+    t_bad "deep check: a healthy delivery still goes through" "it was refused -- false positive"
+  fi
+  if [ -n "$(find "$_d/done" -name '*damaged*' 2>/dev/null)" ]; then
+    t_bad "deep check: a structurally damaged delivery never reaches done" \
+      "it was OCRed and filed"
+  else
+    t_ok "deep check: a structurally damaged delivery never reaches done"
+  fi
+}
+
 # ---- batches are bounded by PAGES, and pictures are valid input ----------
 t_batching() {
   _d="$T_TMP/batching"; t_world "$_d"
@@ -3176,6 +3252,7 @@ do_run_tests() {
   t_concurrent_process
   t_workflow
   t_partial_delivery
+  t_deep_check
   t_cleanup
   t_batching
   t_picture_input
