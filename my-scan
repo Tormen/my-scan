@@ -47,6 +47,8 @@ CANCEL_ALL=
 RESET_ALL=
 PROCESS_ALL=
 PROCESS_RETRY=          # --retry [failed] : re-feed leftovers, not the drop folder
+PROCESS_CLEANUP=        # --cleanup : discard what is provably unrecoverable
+PROCESS_CLEANUP_GO=     # --cleanup go : and actually do it
 WE_HOLD_STAGE_LOCK=
 ASSUME_YES=
 WHAT=                    # subcommand
@@ -166,6 +168,85 @@ WHOAMI="$(/usr/bin/whoami)"
 LOG="/var/log/mine/$WHOAMI/my-scan.log"   # "" turns the logfile off
 NFY=""                                    # 1 = notify (my-notify) on error
 my_notify="/LINKS/bin/my-notify"
+
+# HOW my-scan reaches you. Comma-separated, any combination:
+#   notify  = desktop notification
+#   mail    = email (my-notify --mail)
+#   ""      = neither; the logfile only
+NOTIFY_VIA="notify,mail"
+
+# Empty means "let my-notify use its own configured default", so the address
+# lives in ONE place unless you deliberately want my-scan's mail to go
+# somewhere else.
+NOTIFY_MAIL_TO=""                         # recipient
+NOTIFY_MAIL_FROM=""                       # sender
+
+# Prefixed to every subject, so a mail rule can pick these out at a glance.
+NOTIFY_SUBJECT_MARKER="[my-scan]"
+
+# A delivery that arrives EMPTY or TRUNCATED means a document was scanned and
+# never made it -- the bytes are gone, and only you can rescan it. That is
+# worth telling someone about rather than quarantining in silence, which is
+# how five such documents went unnoticed for months.
+NOTIFY_ON_BAD_DELIVERY=1                  # "" turns it off
+
+# Names in a watched folder that are NEVER documents: Finder droppings, the
+# FTP daemon's own bookkeeping, editor swap files. Space-separated globs,
+# matched against the BASENAME. my-scan must not try to read these -- the FTP
+# daemon's '.ftpquota' is not even readable by us, and settling it fails.
+IGNORE_FILENAME_PATTERNS=".* @eaDir *~ *.part *.crdownload"
+
+# Page counts cost one pdfinfo per document (~22ms) and there is no bulk call:
+# mdls would answer from Spotlight's index in one process, but returns (null)
+# for anything Spotlight has not indexed -- which is the interesting folders.
+# So cache instead, keyed by size+mtime: a document that has not changed is
+# never counted twice, and 'status' stays fast after its first run.
+PAGE_CACHE="/var/lib/mine/$WHOAMI/my-scan.pagecache"   # "" disables the cache
+PAGE_CACHE_MAX=5000                       # lines; pruned oldest-first past this
+
+# One way out to a person, honouring NOTIFY_VIA. my-notify's --mail takes 1-4
+# parameters and infers the meaning from how many: subject / subject+body /
+# to+subject+body / from+to+subject+body -- so an unset address simply falls
+# back to my-notify's own default rather than being passed as an empty string.
+notify_user() { # $1 = subject, $2 = body (optional)
+  [ -n "$NOTIFY_VIA" ] || return 0
+  [ -x "$my_notify" ] || { pe " >>> cannot notify: '$my_notify' not executable"; return 0; }
+  _nu_s="${NOTIFY_SUBJECT_MARKER:+$NOTIFY_SUBJECT_MARKER }$1"
+
+  case ",$NOTIFY_VIA," in
+    *,notify,*) "$my_notify" -- "$_nu_s" "${2:-}" >/dev/null 2>&1 ;;
+  esac
+  case ",$NOTIFY_VIA," in
+    *,mail,*)
+      if   [ -n "$NOTIFY_MAIL_FROM" ] && [ -n "$NOTIFY_MAIL_TO" ]; then
+        "$my_notify" --mail "$NOTIFY_MAIL_FROM" "$NOTIFY_MAIL_TO" "$_nu_s" "${2:-}" >/dev/null 2>&1
+      elif [ -n "$NOTIFY_MAIL_TO" ]; then
+        "$my_notify" --mail "$NOTIFY_MAIL_TO" "$_nu_s" "${2:-}" >/dev/null 2>&1
+      else
+        "$my_notify" --mail "$_nu_s" "${2:-}" >/dev/null 2>&1
+      fi
+      [ "$?" -eq 0 ] || pe " >>> WARNING: could not send the mail (my-notify alerts itself)" ;;
+  esac
+  return 0
+}
+
+# A delivery that never arrived intact. Says WHAT is wrong and WHAT TO DO,
+# because the only remedy is at the scanner: the bytes are not recoverable.
+notify_bad_delivery() { # $1 = file, $2 = what is wrong
+  [ -n "$NOTIFY_ON_BAD_DELIVERY" ] || return 0
+  notify_user "scan lost in transfer: ${1##*/}" \
+"'${1##*/}' arrived $2.
+
+The document was scanned but the bytes never made it -- an FTP/SMB upload that
+stopped part-way leaves exactly this. It cannot be recovered from here, so the
+document has to be SCANNED AGAIN.
+
+It has been quarantined in:
+  $T_PATH_FAILED
+
+Host: $(hostname -s)"
+  return 0
+}
 
 ##### THE SCANNER (pull-scanning: 'my-scan scan') ###########################
 
@@ -774,14 +855,12 @@ retry_files() { # $1 = queue|failed|all
   # my-ocr's own dot-prefixed sidecars, and neither is a document to re-OCR.
   case "${1:-queue}" in
     queue|all)
-      [ -d "$OCR_QUEUE_PATH" ] && find "$OCR_QUEUE_PATH" -mindepth 1 -maxdepth 1 \
-        -type f ! -name '.*' 2>/dev/null
+      candidate_files "$OCR_QUEUE_PATH"
       ;;
   esac | sort
   case "${1:-queue}" in
     failed|all)
-      [ -d "$T_PATH_FAILED" ] && find "$T_PATH_FAILED" -mindepth 1 -maxdepth 1 \
-        -type f ! -name '.*' 2>/dev/null
+      candidate_files "$T_PATH_FAILED"
       ;;
   esac | sort
 }
@@ -829,14 +908,82 @@ stage_lock_release() {
 # Pages in one document. A picture is one page; anything we cannot read counts
 # as one too -- guessing high would starve a batch, guessing zero would let an
 # unbounded document slip into it.
+# The cache key is size+mtime, so an edited file is recounted and an untouched
+# one never is. A miss costs exactly what it used to.
+page_cache_get() { # $1 = key -> pages, or nothing
+  [ -n "$PAGE_CACHE" ] && [ -f "$PAGE_CACHE" ] || return 1
+  _pcg="$(awk -F"$TAB" -v k="$1" '$1==k {print $2; exit}' "$PAGE_CACHE" 2>/dev/null)"
+  [ -n "$_pcg" ] || return 1
+  printf '%s\n' "$_pcg"
+}
+page_cache_put() { # $1 = key, $2 = pages
+  [ -n "$PAGE_CACHE" ] || return 0
+  mkdir -p "${PAGE_CACHE%/*}" 2>/dev/null || return 0
+  printf '%s%s%s\n' "$1" "$TAB" "$2" >>"$PAGE_CACHE" 2>/dev/null || return 0
+  # keep it bounded; the newest entries are the ones worth having
+  _pcn="$(awk 'END{print NR+0}' "$PAGE_CACHE" 2>/dev/null)"
+  _pcm="$PAGE_CACHE_MAX"; isInt "$_pcm" || _pcm=5000
+  if [ "$_pcn" -gt "$_pcm" ]; then
+    tail -n "$(( _pcm / 2 ))" "$PAGE_CACHE" >"$PAGE_CACHE.new" 2>/dev/null \
+      && mv -f "$PAGE_CACHE.new" "$PAGE_CACHE" 2>/dev/null
+  fi
+  return 0
+}
+
 page_count() { # $1 = file
+  _pk="$(file_size "$1"):$(file_mtime "$1"):$1"
+  _pc="$(page_cache_get "$_pk")" && { printf '%s\n' "$_pc"; return 0; }
   case "$(file --brief "$1" 2>/dev/null | cut -f1 -d' ')" in
     PDF)
       _pc="$("$c_pdfinfo" "$1" 2>/dev/null | awk '/^Pages:/{print $2; exit}')"
-      case "$_pc" in ''|*[!0-9]*) _pc=1 ;; esac
-      printf '%s\n' "$_pc" ;;
-    *) printf '1\n' ;;
+      case "$_pc" in ''|*[!0-9]*) _pc=1 ;; esac ;;
+    *) _pc=1 ;;
   esac
+  page_cache_put "$_pk" "$_pc"
+  printf '%s\n' "$_pc"
+}
+
+# Is this name one we never treat as a document?
+is_ignored_name() { # $1 = path
+  _in_b="${1##*/}"
+  for _in_p in $IGNORE_FILENAME_PATTERNS; do
+    # shellcheck disable=SC2254  # config-supplied globs, deliberately unquoted
+    case "$_in_b" in $_in_p) return 0 ;; esac
+  done
+  return 1
+}
+
+# Every file in a folder that IS a candidate document. One definition, used by
+# everything that walks a folder -- counting one set and processing another is
+# how ".ftpquota" reached settle and how "10 documents / 9 pages" was printed.
+candidate_files() { # $1 = dir
+  [ -d "$1" ] || return 0
+  find "$1" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | while IFS= read -r _cf_f; do
+    [ -n "$_cf_f" ] || continue
+    is_ignored_name "$_cf_f" || printf '%s\n' "$_cf_f"
+  done
+}
+
+# Under -V, one line per file: what it is, how many pages, what it is called.
+# A summary says "4 BROKEN"; this says WHICH four, which is what you need to
+# decide whether to rescan them.
+queue_detail() { # $1 = dir, $2 = line prefix
+  [ "$VRB" = "1" ] || return 0
+  [ -d "$1" ] || return 0
+  # keep the prefix OUT of $2: 'set --' below overwrites the positionals
+  _qd_pfx="$2"
+  candidate_files "$1" | sort | while IFS= read -r _qd_f; do
+    [ -n "$_qd_f" ] || continue
+    # shellcheck disable=SC2046  # deliberate: "ok <pages>" splits into $1 $2
+    set -- $(classify_file "$_qd_f")
+    case "$1" in
+      ok)     _p "${_qd_pfx}          | ok     $(printf '%5s' "${2:-?}")p  ${_qd_f##*/}" ;;
+      broken) _p "${_qd_pfx}          | BROKEN      -  ${_qd_f##*/}" ;;
+      empty)  _p "${_qd_pfx}          | EMPTY       -  ${_qd_f##*/}" ;;
+      *)      _p "${_qd_pfx}          | other       -  ${_qd_f##*/}" ;;
+    esac
+  done
+  return 0
 }
 
 # What IS this file? "failed" lumps together things that need different
@@ -871,7 +1018,7 @@ count_docs_pages() { # $1 = dir
   fi
   _cdp_ok=0; _cdp_p=0; _cdp_br=0; _cdp_em=0; _cdp_ot=0
   _cdp_t="$(mktemp /tmp/my-scan.pages.XXXXXX)" || { printf '%s files\n' "$_cdp_n"; return 0; }
-  find "$1" -mindepth 1 -maxdepth 1 -type f 2>/dev/null >"$_cdp_t"
+  candidate_files "$1" >"$_cdp_t"
   while IFS= read -r _cdp_f; do
     [ -n "$_cdp_f" ] || continue
     # shellcheck disable=SC2046  # deliberate: "ok <pages>" splits into $1 $2
@@ -897,7 +1044,7 @@ count_docs_pages() { # $1 = dir
 pending_files() {
   for _pd in $DROP_PATHS; do
     [ -d "$_pd" ] || continue
-    find "$_pd" -mindepth 1 -maxdepth 1 -type f 2>/dev/null
+    candidate_files "$_pd"
   done | sort
 }
 
@@ -978,6 +1125,67 @@ _EOCH_
   return 0
 }
 
+# The counterpart of --retry: --retry re-feeds what MIGHT work, --cleanup
+# discards what provably cannot. A 0-byte or unparseable file holds no
+# document -- the bytes never arrived and cannot be reconstructed here, so
+# keeping it only makes the FAILED count lie about how much is really wrong.
+#
+# It goes to the TRASH, never rm: "provably unrecoverable" is still my
+# judgement, and you get to disagree with it.
+do_cleanup_unrecoverable() {
+  _cu_dirs="$T_PATH_FAILED $OCR_QUEUE_PATH"
+  _cu_t="$(mktemp /tmp/my-scan.cleanup.XXXXXX)" || err 071 "mktemp failed."
+  for _cu_d in $_cu_dirs; do
+    [ -d "$_cu_d" ] || continue
+    candidate_files "$_cu_d" | sort | while IFS= read -r _cu_f; do
+      [ -n "$_cu_f" ] || continue
+      # shellcheck disable=SC2046  # deliberate: "ok <pages>" splits into $1 $2
+      set -- $(classify_file "$_cu_f")
+      case "$1" in
+        empty|broken) printf '%s%s%s\n' "$1" "$TAB" "$_cu_f" ;;
+      esac
+    done
+  done >"$_cu_t"
+
+  _cu_n="$(awk 'NF{n++} END{print n+0}' "$_cu_t")"
+  if [ "$_cu_n" -eq 0 ]; then
+    _p " >>> nothing unrecoverable -- every file in the queues holds a document."
+    rm -f "$_cu_t"; return 0
+  fi
+
+  _p " >>> $_cu_n file(s) hold no recoverable document:"
+  while IFS="$TAB" read -r _cu_w _cu_f; do
+    [ -n "$_cu_f" ] || continue
+    _p "     $(printf '%-7s' "$_cu_w")  ${_cu_f##*/}"
+  done <"$_cu_t"
+  _p ""
+  _p "     EMPTY  = 0 bytes: the upload never delivered anything"
+  _p "     BROKEN = truncated or unparseable: the upload stopped part-way"
+  _p "     Neither can be recovered here. The document must be SCANNED AGAIN."
+
+  if [ -z "$PROCESS_CLEANUP_GO" ]; then
+    _p ""
+    _p " >>> nothing removed -- this was a dry run. To move them to the Trash:"
+    _p "     $US process --cleanup go"
+    rm -f "$_cu_t"; return 0
+  fi
+
+  [ -x "$c_trash" ] || { rm -f "$_cu_t"; err 083 "NOT FOUND: '$c_trash' -- refusing to delete outright."; }
+  _cu_done=0
+  while IFS="$TAB" read -r _cu_w _cu_f; do
+    [ -n "$_cu_f" ] || continue
+    if "$c_trash" -- "$_cu_f" >/dev/null 2>&1; then
+      _cu_done=$(( _cu_done + 1 )); _p "     trashed ($_cu_w)  ${_cu_f##*/}"
+    else
+      _p "     FAILED to trash  ${_cu_f##*/}"
+    fi
+  done <"$_cu_t"
+  rm -f "$_cu_t"
+  _p ""
+  _p " >>> $_cu_done file(s) moved to the Trash -- recoverable there if I judged wrong [0]"
+  return 0
+}
+
 # Retry: the files are already staged and named, so this is my-ocr plus the
 # filing step -- no settle, no rename. Anything my-ocr still cannot do lands
 # back in FAILED, so a retry can be repeated without making a mess.
@@ -1033,6 +1241,11 @@ do_process() {
   #   stdin        -> exactly those files (what the Folder Action pipes in)
   #   neither      -> LIST what is pending and change nothing, so 'process'
   #                   on its own is a question, never an accident
+  if [ -n "$PROCESS_CLEANUP" ]; then
+    do_cleanup_unrecoverable
+    exit $?
+  fi
+
   if [ -n "$PROCESS_RETRY" ]; then
     [ -n "$PROCESS_ALL" ] && process_start_log
     # A file here is already settled, named and staged, so it goes straight to
@@ -1119,6 +1332,7 @@ do_process() {
       FAILED_CNT=$(( FAILED_CNT + 1 ))
       T_PATH="$T_PATH_FAILED"; stage_file
       T_PATH="$OCR_QUEUE_PATH"
+      notify_bad_delivery "$S_INP" "incomplete -- it never settled within ${SETTLE_TIMEOUT}s (${SETTLE_REASON:-unknown})"
       err 028 "'$S_INP' never settled within ${SETTLE_TIMEOUT}s -- filed under FAILED." "-"
       continue
     fi
@@ -1134,6 +1348,10 @@ do_process() {
       FAILED_CNT=$(( FAILED_CNT + 1 ))
       T_PATH="$T_PATH_FAILED"; stage_file
       T_PATH="$OCR_QUEUE_PATH"
+      case "$INP_FILE_TYPE" in
+        empty*) notify_bad_delivery "$S_INP" "EMPTY (0 bytes)" ;;
+        *)      notify_bad_delivery "$S_INP" "unreadable -- '$INP_FILE_TYPE', not a document my-ocr can OCR" ;;
+      esac
       err 030 "Unexpected file type '$INP_FILE_TYPE' -- filed under FAILED." "-"
       continue
     fi
@@ -1379,7 +1597,7 @@ _EOCL_
 
 count_files() { # $1 = dir -> number of plain files in it, "-" if missing
   [ -d "$1" ] || { _p "-"; return 1; }
-  find "$1" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' '
+  candidate_files "$1" | wc -l | tr -d ' '
 }
 
 running_pids() {
@@ -1536,13 +1754,18 @@ do_status() {
     _q2n="$_q2d  STRANDED: nothing will pick these up ('$US process --retry')"
   fi
   _p "${_pfx}QUEUE     2ocr  $OCR_QUEUE_PATH  $_q2n"
+  queue_detail "$OCR_QUEUE_PATH" "$_pfx"
   _qf="$(count_files "$T_PATH_FAILED")"
   if [ "$_qf" = "0" ]; then
     _p "${_pfx}QUEUE     fail  $T_PATH_FAILED  empty"
   else
     _p "${_pfx}QUEUE     fail  $T_PATH_FAILED  $(count_docs_pages "$T_PATH_FAILED")  my-ocr could not OCR these ('$US process --retry failed')"
+    queue_detail "$T_PATH_FAILED" "$_pfx"
   fi
-  [ "$VRB" = "1" ] && _p "${_pfx}QUEUE     done  $T_PATH_DONE  $(count_files "$T_PATH_DONE") files"
+  if [ "$VRB" = "1" ]; then
+    _p "${_pfx}QUEUE     done  $T_PATH_DONE  $(count_docs_pages "$T_PATH_DONE")"
+    queue_detail "$T_PATH_DONE" "$_pfx"
+  fi
 
   _p "${_pfx}FOLDERACTION $(folder_action_state)"
   [ "$VRB" = "1" ] && _p "${_pfx}          workflow: $WORKFLOW_DIR/$WORKFLOW_NAME$( [ -d "$WORKFLOW_DIR/$WORKFLOW_NAME" ] && echo " (present)" || echo " (MISSING)" )"
@@ -1625,7 +1848,7 @@ cancel_list() { # writes "state<TAB>path" lines
   _i=1
   for _dp in $DROP_PATHS; do
     [ -d "$_dp" ] || continue
-    find "$_dp" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | while IFS= read -r _f; do
+    candidate_files "$_dp" | while IFS= read -r _f; do
       [ -n "$_f" ] && printf 'arriving\t%s\n' "$_f"
     done
   done
@@ -2657,12 +2880,24 @@ t_workflow() {
 t_partial_delivery() {
   _d="$T_TMP/partial"; t_world "$_d"
 
-  # (a) zero bytes -- what a Folder Action sees the instant a file is created
+  # (a) zero bytes -- what a Folder Action sees the instant a file is created.
+  # Asserting only "not filed as done" would be VACUOUS: without the guard it
+  # settles, stages, and is then refused by the TYPE check, ending in FAILED
+  # either way. What must be true is that SETTLE refuses it, and says why.
   : >"$_d/drop/justcreated.pdf"
-  "$0" --config "$T_CONF" --settle-timeout 4 process --all >/dev/null 2>&1 </dev/null
+  _o="$("$0" --config "$T_CONF" --settle-timeout 4 process --all 2>&1 </dev/null)"
+  case "$_o" in
+    *"empty (0 bytes)"*|*"never settled"*)
+      t_ok "partial: settle refuses a 0-byte delivery, and names the reason";;
+    *"Unexpected file type"*)
+      t_bad "partial: settle refuses a 0-byte delivery, and names the reason" \
+        "settle PASSED it; only the later type check caught it -- 0 bytes is size-stable";;
+    *)
+      t_bad "partial: settle refuses a 0-byte delivery, and names the reason" \
+        "$(printf '%s' "$_o" | grep -iE 'settle|type|empty' | head -n 1)";;
+  esac
   if [ -n "$(find "$_d/done" -name '*justcreated*' 2>/dev/null)" ]; then
-    t_bad "partial: a 0-byte delivery is never filed as done" \
-      "an empty file was staged and filed -- settle let it through"
+    t_bad "partial: a 0-byte delivery is never filed as done" "it was filed"
   else
     t_ok "partial: a 0-byte delivery is never filed as done"
   fi
@@ -2680,6 +2915,43 @@ t_partial_delivery() {
   fi
 }
 
+# ---- discarding what holds no document ------------------------------------
+t_cleanup() {
+  _d="$T_TMP/cleanup"; t_world "$_d"
+  : >"$_d/failed/2026-09-08_0101.01___nothing.pdf"                 # 0 bytes
+  t_pdf "$_d/full.pdf"
+  dd if="$_d/full.pdf" of="$_d/failed/2026-09-08_0102.02___cut.pdf" bs=1 count=180 2>/dev/null
+  t_pdf "$_d/failed/2026-09-08_0103.03___intact.pdf"               # a real document
+
+  _o="$("$0" --config "$T_CONF" process --cleanup 2>&1 </dev/null)"
+  case "$_o" in
+    *nothing.pdf*cut.pdf*|*cut.pdf*nothing.pdf*)
+      t_ok "cleanup: lists the empty and the truncated file";;
+    *) t_bad "cleanup: lists the empty and the truncated file" "$(printf '%s' "$_o" | head -n 2)";;
+  esac
+  case "$_o" in
+    *intact.pdf*) t_bad "cleanup: never lists a file that holds a document" "it offered to delete an intact PDF";;
+    *)            t_ok "cleanup: never lists a file that holds a document";;
+  esac
+  if [ -f "$_d/failed/2026-09-08_0101.01___nothing.pdf" ]; then
+    t_ok "cleanup: listing alone removes nothing"
+  else
+    t_bad "cleanup: listing alone removes nothing" "a bare --cleanup deleted something"
+  fi
+
+  "$0" --config "$T_CONF" process --cleanup go >/dev/null 2>&1 </dev/null
+  if [ -f "$_d/failed/2026-09-08_0101.01___nothing.pdf" ] || [ -f "$_d/failed/2026-09-08_0102.02___cut.pdf" ]; then
+    t_bad "cleanup go: the unrecoverable files are gone" "they are still there"
+  else
+    t_ok "cleanup go: the unrecoverable files are gone"
+  fi
+  if [ -f "$_d/failed/2026-09-08_0103.03___intact.pdf" ]; then
+    t_ok "cleanup go: the intact document is untouched"
+  else
+    t_bad "cleanup go: the intact document is untouched" "a real document was deleted"
+  fi
+}
+
 # ---- batches are bounded by PAGES, and pictures are valid input ----------
 t_batching() {
   _d="$T_TMP/batching"; t_world "$_d"
@@ -2694,8 +2966,8 @@ t_batching() {
     t_bad "batching: 3 pages with a 2-page cap becomes >1 chunk" "got $_c chunk line(s)"
   fi
   _f="$(find "$_d/done" -name '*.pdf' -type f 2>/dev/null | wc -l | tr -d ' ')"
-  [ "$_f" = "3" ] && t_ok "batching: every document is still filed ($_f/3)" \
-                  || t_bad "batching: every document is still filed" "filed $_f of 3"
+  if [ "$_f" = "3" ]; then t_ok "batching: every document is still filed ($_f/3)"
+  else t_bad "batching: every document is still filed" "filed $_f of 3"; fi
 
   # a document larger than the cap must still go, alone -- never starved
   _d2="$T_TMP/oversize"; t_world "$_d2"
@@ -2714,8 +2986,8 @@ t_batching() {
   for n in 1 2 3; do t_pdf "$_d3/drop/n$n.pdf"; done
   "$0" --config "$_d3/conf.cap" process --all >/dev/null 2>&1 </dev/null
   _a="$(awk 'END{print NR+0}' "$_d3/ocr.args" 2>/dev/null)"
-  [ "$_a" = "3" ] && t_ok "batching: cap 0 means one call for everything" \
-                  || t_bad "batching: cap 0 means one call for everything" "saw $_a arg(s)"
+  if [ "$_a" = "3" ]; then t_ok "batching: cap 0 means one call for everything"
+  else t_bad "batching: cap 0 means one call for everything" "saw $_a arg(s)"; fi
 }
 
 t_picture_input() {
@@ -2759,7 +3031,9 @@ t_types_agree() {
   _ours="$("$0" --create-config 2>/dev/null | sed -n 's/^ACCEPT_FILE_TYPE_REGEX="\(.*\)"/\1/p')"
   _theirs="$(sed -n 's/^ *S_EXPECTED_FILE_TYPE___REGEX="\([^"]*\)".*/\1/p' "$_real" | head -n 1)"
   # compare the sets, order and spacing aside
+  # shellcheck disable=SC1003  # stripping a literal backslash out of the regex
   _a="$(printf '%s' "$_ours"   | tr -d ' \\' | tr '|' '\n' | sort | tr '\n' ',')"
+  # shellcheck disable=SC1003  # stripping a literal backslash from the regex
   _b="$(printf '%s' "$_theirs" | tr -d ' \\' | tr '|' '\n' | sort | tr '\n' ',')"
   if [ "$_a" = "$_b" ]; then
     t_ok "type agreement: my-scan and my-ocr accept the same types ($_a)"
@@ -2902,6 +3176,7 @@ do_run_tests() {
   t_concurrent_process
   t_workflow
   t_partial_delivery
+  t_cleanup
   t_batching
   t_picture_input
   t_types_agree
@@ -2927,9 +3202,10 @@ usage: $US [OPTIONAL] <MANDATORY> parameters.
   $US scan     [OPTIONS] [<FNAME.pdf> [SCANNER_PARAMS...]]  pull-scan a device
   $US process  [OPTIONS] [--all]                    filenames on stdin, or --all
   $US process --retry [failed|all] [--all]          re-feed leftovers
+  $US process --cleanup [go]                        discard what cannot be recovered
   $US setup    [OPTIONS] [go]                       install the Folder Action
   $US install  [OPTIONS] [go]                       synonym for 'setup'
-  $US uninstall [OPTIONS] [go]                      remove it again (never documents)
+  $US uninstall [OPTIONS] [go]                      remove the Folder Action + workflow
   $US status   [OPTIONS]                            what the pipeline is doing
   $US cancel   [OPTIONS] [<ID>...]                  documents in flight
   $US reset    [OPTIONS]                            stuck machinery (never documents)
@@ -2985,8 +3261,8 @@ EXAMPLES:
   $US --duplex bank-statement.pdf         duplex scan to a named file
   $US setup                               dry-run the Folder Action install
   $US setup go                            apply it
-  $US uninstall                           dry-run removing the wiring
-  $US uninstall go                        remove it (documents stay untouched)
+  $US uninstall                           dry-run removing the Folder Action
+  $US uninstall go                        remove the wiring; documents stay put
   $US -V status                           ...and why a delivery is not moving
   $US status --watch                      live: one line per change, until drained
   $US status --watch 0.5                  ...polling twice a second
@@ -2996,6 +3272,8 @@ EXAMPLES:
   $US process --retry                     list what is stranded in the OCR queue
   $US process --retry --all               hand it back to my-ocr
   $US process --retry failed --all        ...and the ones my-ocr could not do
+  $US process --cleanup                   list empty/truncated files (no document in them)
+  $US process --cleanup go                move those to the Trash
   ls -1d <dir>/* | head -10 | $US process process just those ten
 _EOU_
   exit 0
@@ -3033,6 +3311,8 @@ while [ $# -gt 0 ]; do
     --all)               CANCEL_ALL=1; RESET_ALL=1; PROCESS_ALL=1 ;;
     --retry)             PROCESS_RETRY="queue"
                          case "$1" in failed|all) PROCESS_RETRY="$1"; shift ;; esac ;;
+    --cleanup)           PROCESS_CLEANUP=1
+                         case "$1" in go) PROCESS_CLEANUP_GO=1; shift ;; esac ;;
     --yes)               ASSUME_YES=1 ;;
     -S|--status)         WHAT="status" ;;
     scan|process|setup|install|uninstall|status|cancel|reset|devices|stamp-version)
