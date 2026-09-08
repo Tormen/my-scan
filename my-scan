@@ -11,7 +11,7 @@
 # 081 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="44f2a32"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="c51d516"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 
 US="${0##*/}"
 

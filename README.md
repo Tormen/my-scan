@@ -194,6 +194,33 @@ assumed -- TIFF was added only after FineReader was shown to take one and
 return a searchable PDF. WebP is deliberately absent: macOS `sips` cannot even
 write it on these machines, and this FineReader predates WebP by years.
 
+## Checking the document, at both ends
+
+A scan is checked on the way IN and the result is checked on the way OUT,
+because in between the original is destroyed: my-ocr replaces it in place and
+moves it to the Trash a moment earlier.
+
+**On the way in**, once per delivery after it settles: `qpdf --check`. settle's
+own parse test only proves `pdfinfo` can read the catalogue; a file whose page
+CONTENT was damaged in transit passes that and fails this. qpdf's exit is
+graded and read as such -- 0 clean, 3 warnings only, 2 damage -- because
+treating every non-zero as damage would quarantine healthy documents over
+cosmetic warnings.
+
+**On the way out**, before the result may replace the original, my-ocr requires
+all of: it parses, its page count is **not lower** than the input's, its
+Producer names the OCR application, `qpdf --check` passes, and it carries a
+text layer. More pages out is fine -- the OCR application splits a sheet it
+believes holds several pages.
+
+Deliberately NOT checked: file size (MRC compression makes a much smaller
+result the healthy outcome) and image counts (MRC splits one scan image into
+mask/foreground/background layers).
+
+If any gate fails it is a clean rollback: the bad result goes to the Trash, the
+ORIGINAL is kept and quarantined to `02_FAILED_OCR`, and you are notified with
+the reason and where the document now is.
+
 ## cancel — documents
 
 ```sh
