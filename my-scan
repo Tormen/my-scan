@@ -574,6 +574,10 @@ settle_parses() { # $1 = file. 0 = parses as a type we accept.
     JPEG|PNG|TIFF)
           if [ -x "$c_identify" ]; then "$c_identify" "$1" >/dev/null 2>&1; return $?
           else "$c_convert" "$1" -print '' /dev/null >/dev/null 2>&1; return $?; fi ;;
+    empty)
+          # not a type, an absence: 'file' says this for a zero-byte file
+          ddbg "settle: '$1' is empty -- not a delivery"
+          return 1 ;;
     *)    ddbg "settle: '$1' has type '$_type' -- no parser, treating as parsed"
           return 0 ;;
   esac
@@ -589,6 +593,16 @@ settle_check() {
   _sc_f="$1"; _sc_prev="$2"
   if [ ! -e "$_sc_f" ]; then SETTLE_SIZE=""; SETTLE_REASON="vanished"; return 1; fi
   SETTLE_SIZE="$(file_size "$_sc_f")"
+
+  # Zero bytes is never a delivery. A Folder Action fires when a file is
+  # CREATED, not when it is complete, so an upload is regularly seen at 0
+  # bytes -- and 0 is trivially "stable", so without this the size check
+  # passes and an empty file sails through. Every empty and truncated file
+  # in the FAILED folder was made exactly this way, by a pipeline that had
+  # no settle at all.
+  if [ "${SETTLE_SIZE:-0}" -eq 0 ] 2>/dev/null; then
+    SETTLE_REASON="empty (0 bytes) -- nothing has been written yet"; return 1
+  fi
 
   if settle_writer_busy "$_sc_f"; then
     SETTLE_REASON="an SMB/FTP writer still holds it"; return 1
@@ -825,24 +839,57 @@ page_count() { # $1 = file
   esac
 }
 
-# "<documents>/<pages>" for a directory, or "<documents>" alone when counting
-# pages would cost more than the answer is worth.
+# What IS this file? "failed" lumps together things that need different
+# answers: an empty file is a delivery that never arrived, a broken one is a
+# damaged document, and a Finder dropping is not a document at all.
+#   ok <pages> | broken | empty | other
+classify_file() { # $1 = file
+  [ -e "$1" ] || { printf 'other\n'; return 0; }
+  case "${1##*/}" in .*) printf 'other\n'; return 0 ;; esac   # .DS_Store, sidecars
+  [ -s "$1" ] || { printf 'empty\n'; return 0; }
+  case "$(file --brief "$1" 2>/dev/null | cut -f1 -d' ')" in
+    PDF)
+      _cf_p="$("$c_pdfinfo" "$1" 2>/dev/null | awk '/^Pages:/{print $2; exit}')"
+      case "$_cf_p" in
+        ''|*[!0-9]*|0) printf 'broken\n' ;;                   # pdfinfo cannot read it
+        *)             printf 'ok %s\n' "$_cf_p" ;;
+      esac ;;
+    JPEG|PNG|TIFF) printf 'ok 1\n' ;;                         # a picture is one page
+    *)             printf 'other\n' ;;
+  esac
+}
+
+# A directory in one line. Counting and summing MUST walk the same set of
+# files -- counting everything while summing only some is how "10 documents /
+# 9 pages" happened, an arithmetic impossibility printed with a straight face.
 count_docs_pages() { # $1 = dir
   _cdp_n="$(count_files "$1")"
   if [ "$_cdp_n" = "0" ]; then printf 'empty\n'; return 0; fi
   _lim="$PAGE_COUNT_MAX_FILES"; isInt "$_lim" || _lim=40
   if [ "$_cdp_n" -gt "$_lim" ] && [ "$VRB" != "1" ]; then
-    printf '%s documents (-V counts the pages)\n' "$_cdp_n"; return 0
+    printf '%s files (-V looks at them)\n' "$_cdp_n"; return 0
   fi
-  _cdp_p=0
-  _cdp_t="$(mktemp /tmp/my-scan.pages.XXXXXX)" || { printf '%s documents\n' "$_cdp_n"; return 0; }
-  find "$1" -mindepth 1 -maxdepth 1 -type f ! -name '.*' 2>/dev/null >"$_cdp_t"
+  _cdp_ok=0; _cdp_p=0; _cdp_br=0; _cdp_em=0; _cdp_ot=0
+  _cdp_t="$(mktemp /tmp/my-scan.pages.XXXXXX)" || { printf '%s files\n' "$_cdp_n"; return 0; }
+  find "$1" -mindepth 1 -maxdepth 1 -type f 2>/dev/null >"$_cdp_t"
   while IFS= read -r _cdp_f; do
     [ -n "$_cdp_f" ] || continue
-    _cdp_p=$(( _cdp_p + $(page_count "$_cdp_f") ))
+    # shellcheck disable=SC2046  # deliberate: "ok <pages>" splits into $1 $2
+    set -- $(classify_file "$_cdp_f")
+    case "$1" in
+      ok)     _cdp_ok=$(( _cdp_ok + 1 )); _cdp_p=$(( _cdp_p + ${2:-1} )) ;;
+      broken) _cdp_br=$(( _cdp_br + 1 )) ;;
+      empty)  _cdp_em=$(( _cdp_em + 1 )) ;;
+      *)      _cdp_ot=$(( _cdp_ot + 1 )) ;;
+    esac
   done <"$_cdp_t"
   rm -f "$_cdp_t"
-  printf '%s documents / %s pages\n' "$_cdp_n" "$_cdp_p"
+  # the clean case stays clean; the rest is only named when it exists
+  _cdp_s="$_cdp_ok document(s) / $_cdp_p page(s)"
+  [ "$_cdp_br" -gt 0 ] && _cdp_s="$_cdp_s, $_cdp_br BROKEN"
+  [ "$_cdp_em" -gt 0 ] && _cdp_s="$_cdp_s, $_cdp_em EMPTY"
+  [ "$_cdp_ot" -gt 0 ] && _cdp_s="$_cdp_s, $_cdp_ot not a document"
+  printf '%s\n' "$_cdp_s"
 }
 
 # Everything sitting in a drop folder, oldest first -- that is the order they
@@ -2603,6 +2650,36 @@ t_workflow() {
   fi
 }
 
+# ---- an upload caught mid-flight must never be staged --------------------
+# Every truncated file found in the live FAILED folder was an exact multiple
+# of 4096 bytes with no %%EOF: copied while the FTP daemon was still writing.
+# These are the two shapes that failure takes.
+t_partial_delivery() {
+  _d="$T_TMP/partial"; t_world "$_d"
+
+  # (a) zero bytes -- what a Folder Action sees the instant a file is created
+  : >"$_d/drop/justcreated.pdf"
+  "$0" --config "$T_CONF" --settle-timeout 4 process --all >/dev/null 2>&1 </dev/null
+  if [ -n "$(find "$_d/done" -name '*justcreated*' 2>/dev/null)" ]; then
+    t_bad "partial: a 0-byte delivery is never filed as done" \
+      "an empty file was staged and filed -- settle let it through"
+  else
+    t_ok "partial: a 0-byte delivery is never filed as done"
+  fi
+
+  # (b) truncated -- a real PDF cut at a block boundary, no %%EOF
+  _d2="$T_TMP/truncated"; t_world "$_d2"
+  t_pdf "$_d2/full.pdf"
+  dd if="$_d2/full.pdf" of="$_d2/drop/cutoff.pdf" bs=1 count=200 2>/dev/null
+  "$0" --config "$T_CONF" --settle-timeout 4 process --all >/dev/null 2>&1 </dev/null
+  if [ -n "$(find "$_d2/done" -name '*cutoff*' 2>/dev/null)" ]; then
+    t_bad "partial: a truncated PDF is never filed as done" \
+      "it does not parse, so settle must refuse it"
+  else
+    t_ok "partial: a truncated PDF is never filed as done"
+  fi
+}
+
 # ---- batches are bounded by PAGES, and pictures are valid input ----------
 t_batching() {
   _d="$T_TMP/batching"; t_world "$_d"
@@ -2824,6 +2901,7 @@ do_run_tests() {
   t_stage_failure
   t_concurrent_process
   t_workflow
+  t_partial_delivery
   t_batching
   t_picture_input
   t_types_agree
