@@ -1,0 +1,3029 @@
+#!/bin/dash
+#
+# my-scan -- receive, settle, OCR and file scanned documents.
+#
+# Harmonises what used to be four scripts:
+#   my-scan                                 -> 'scan'    (pull-scan a device)
+#   my-scan-folder-spooler                  -> 'settle'  (wait for a complete file)
+#   my-scan-processor-macos                 -> 'process' (OCR now goes to my-ocr)
+#   my-scan-processor-macos___wait-for-ocr  -> 'watch'   (OCR deblock watchdog)
+#
+# 081 == highest used errCode
+
+SCRIPT_VERSION="v1.0"
+SCRIPT_COMMIT="44f2a32"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+
+US="${0##*/}"
+
+PID="$(/usr/bin/printf "%06d" "$$")"   # IDENTITY: goes into lock names and "___,ID,<pid>"
+LOGPFX="$PID"                          # LOG COLUMN only; the watchdog widens it
+
+NL="
+"
+TAB="$(printf '\t')"
+
+# settle has to run wherever the scanner drops files, so nothing below may
+# assume one userland. BSD and GNU differ in exactly the places settle uses.
+MY_OS="$(uname -s)"
+LSOF_WARNED=""      # warn once, not every poll
+
+
+##############################################################################
+#### FLAG STATE (set from argv; NO behaviour defaults live here -- see the
+#### config file, whose only source is _default_config_content() below)
+
+QUIET=0
+VRB=
+DBG=
+DEEPDBG=
+DBG_LOGFILE=
+
+CONFIG=                  # --config <FILE>
+CREATE_CONFIG=           # --create-config [<FILE>]
+CREATE_CONFIG_FILE=
+DRY_RUN=
+NO_LOG=                  # -L|--no-log
+CANCEL_ALL=
+RESET_ALL=
+PROCESS_ALL=
+PROCESS_RETRY=          # --retry [failed] : re-feed leftovers, not the drop folder
+WE_HOLD_STAGE_LOCK=
+ASSUME_YES=
+WHAT=                    # subcommand
+REDIRECT_TO_LOG=
+LOG_IS_STDERR=          # stderr has been redirected into $LOG
+
+# counters
+INP_FILES=
+INP_FILES_CNT=0
+FILES_OCRED_CNT=0
+FAILED_CNT=0
+WRONG_FILETYPE_CNT=0
+IGNORED_CNT=0
+
+
+
+##############################################################################
+#### OUTPUT HELPERS
+##
+## Prefix convention:  " >>> " major   "  >> " medium   "    > " minor detail
+##                     " ~~~ " debug   "   ~ " deep debug
+## In pipeline (process/watch) mode every line is additionally prefixed with
+## the PID column so concurrent runs stay readable in one shared log.
+
+_p() { printf '%s\n' "$*"; }
+
+# pipeline-prefixed echo (the log format the Automator-driven parts use)
+pe() { printf '%s|%s\n' "$LOGPFX" "$*"; }
+
+msg()  { [ "$QUIET" = "1" ] && return 0; _p " >>> $*"; }
+msg2() { [ "$QUIET" = "1" ] && return 0; _p "  >> $*"; }
+det()  { [ "$QUIET" = "1" ] && return 0; _p "    > $*"; }
+
+vrb()  { [ "$VRB" = "1" ] || return 0; _p " >>> $*"; }
+vdet() { [ "$VRB" = "1" ] || return 0; _p "    > $*"; }
+
+dbg()  { [ "$DBG" = "1" ] || return 0; _p " ~~~ $*" 1>&2
+         [ -n "$DBG_LOGFILE" ] && printf '%s ~~~ %s\n' "$(date -u +%FT%TZ)" "$*" >>"$DBG_LOGFILE"
+         return 0; }
+ddbg() { [ "$DEEPDBG" = "1" ] || return 0; _p "   ~ $*" 1>&2; return 0; }
+
+indent() { # $1 = text, $2 = prefix
+  [ -z "$1" ] && return 0
+  _ind_pfx="$2"
+  [ -z "$_ind_pfx" ] && _ind_pfx="$LOGPFX|     | "
+  # not sed: the prefix routinely contains "|", which would be read as the
+  # substitute delimiter and break the expression
+  printf '%s\n' "$1" | while IFS= read -r _ind_l; do
+    printf '%s%s\n' "$_ind_pfx" "$_ind_l"
+  done
+}
+
+# run(): single source of truth for the echoed command and the executed one
+run() {
+  [ "$VRB" = "1" ] && _p " >>> $*"
+  "$@"
+}
+
+# set exitCode to "-" to report without exiting
+# shellcheck disable=SC2154  # set by the sourced config file
+err() {
+  _errCode="$1"
+  [ -z "$2" ] && _msg="Please fix." || _msg="$2"
+  [ -z "$3" ] && _exitCode=1 || _exitCode="$3"
+  _outp="ERROR $_errCode [$_exitCode]: $_msg"
+  _now="$(date +"%Y-%m-%d_%H%M.%S")"
+
+  # make sure the error reaches the log even while stdout is restored
+  if [ -n "$LOG" ] && [ -z "$REDIRECT_TO_LOG" ] && [ -z "$LOG_IS_STDERR" ]; then
+    { echo; pe ""; pe "$_now|$_outp"; } >>"$LOG" 2>/dev/null
+  fi
+  { echo; pe ""; pe "$_now|$_outp"; } 1>&2
+
+  if [ -n "$NFY" ] && [ -x "$my_notify" ]; then
+    pe "LAUNCHING: \"$my_notify\" -- \"ERROR $_errCode [$_exitCode]:\" \"$_msg\"" 1>&2
+    "$my_notify" -- "ERROR $_errCode [$_exitCode]:" "$_msg"
+  fi
+
+  [ "$_exitCode" != "-" ] && exit "$_exitCode"
+  return 0
+}
+
+isInt() { [ "$1" -eq "$1" ] 2>/dev/null; }
+# WATCH_INTERVAL may be fractional, so isInt cannot validate it
+isNum() {
+  case "$1" in
+    ''|*[!0-9.]*|*.*.*) return 1 ;;
+    .|.*[!0-9]*)        return 1 ;;
+  esac
+  [ "$1" != "." ] && [ "$1" != "0" ] && [ "$1" != "0.0" ]
+}
+
+
+##############################################################################
+#### CONFIG
+
+_default_config_content() {
+cat <<'_EOCONF_'
+#!/bin/dash
+#
+# my-scan configuration -- plain shell, sourced at startup.
+#
+# Search order (first existing wins):
+#   $MY_SCAN_CONFIG                     env var, escape hatch for CI / tests
+#   --config <FILE>                     explicit, bypasses the search
+#   /LINKS/default/my-scan              primary system-wide location
+#   ~/.my-scan.conf                     per-user override
+#   /etc/my-scan.conf                   system default
+#   /usr/local/etc/my-scan.conf         fallback
+#
+# Every runtime-tunable value lives here. The script body carries no defaults.
+
+WHOAMI="$(/usr/bin/whoami)"
+
+##### LOGGING / NOTIFICATION ################################################
+
+LOG="/var/log/mine/$WHOAMI/my-scan.log"   # "" turns the logfile off
+NFY=""                                    # 1 = notify (my-notify) on error
+my_notify="/LINKS/bin/my-notify"
+
+##### THE SCANNER (pull-scanning: 'my-scan scan') ###########################
+
+# Human-readable name, printed by 'status' and 'devices'.
+SCAN_DEVICE_NAME="EPSON EM-C7100 Series"
+
+# Device as the scan backend addresses it. Either a SANE device name
+#   epson2:net:<ip>            /  epsonscan2:net:<ip>
+# or an eSCL/AirScan base URL
+#   http://<ip>/eSCL
+#
+# It must carry an ADDRESS, not a Bonjour name. Printing does not need one --
+# a macOS print queue stores the mDNS service name ("dnssd://...local./") and
+# re-resolves it at print time -- but that also means the address is written
+# down nowhere, and a printer that is switched off has no mDNS record to
+# resolve at all. 'my-scan devices' can only find one that is powered on.
+SCAN_DEVICE="http://CHANGEME/eSCL"
+
+# 1 if the scanner is normally powered off. Then 'status' reports it as
+# "not answering (normally off)" rather than UNREACHABLE, so a switched-off
+# scanner does not read as a fault. The exit code is printed either way.
+SCAN_DEVICE_USUALLY_OFF=""
+
+# Backend binary. "" = autodetect (scanimage, then epsonscan2, then eSCL/curl).
+c_scanimage=""
+
+SCAN_MODE="Color"        # Lineart | Gray | Color
+SCAN_DPI="200"           # 75 | 100 | 200 | 300 | 600
+SCAN_SOURCE="ADF"        # Flatbed | ADF | Duplex
+SCAN_FORMAT="png"
+SCAN_DEFAULT_OPTS="--format png"
+SCAN_OUT_PATH="/CHANGEME/scans-out"  # results land here; relative names resolve here
+SCAN_DEFAULT_FNAME=".scan.pdf"
+# Opened on the finished scan. "" = do not open anything (for unattended use).
+# The old Linux-era defaults (masterpdfeditor5 / okular) exist on neither Mac.
+#   macOS : open -a Preview
+#   Linux : xdg-open
+# It is run as: $SCAN_VIEWER_CMD "<file>"
+SCAN_VIEWER_CMD="open -a Preview"
+
+##### DELIVERY (where the scanner drops finished files) #####################
+
+# The scanner pushes scans here. List every watched drop folder, space
+# separated -- 'setup' attaches a Folder Action to each, 'status' counts each.
+DROP_PATHS="/Users/CHANGEME/services/ftp/in/scans"
+
+# Label shown per drop path in 'status', in the same order. Free text.
+DROP_LABELS="ftp"
+
+##### SETTLE (was: my-scan-folder-spooler) ##################################
+
+# A file is settled when no writer holds it, its size is stable, and it parses.
+SETTLE_TIMEOUT=600                 # seconds, whole settle for one file
+SETTLE_POLL=1                      # seconds between polls
+SETTLE_STABLE_POLLS=3              # consecutive equal sizes required
+# Processes whose write handle means "still being delivered" (SMB *and* FTP):
+SETTLE_WRITER_PROCS="smbd pure-ftpd pureftpd vsftpd ftpd proftpd"
+SETTLE_LSOF_TIMEOUT=10             # seconds; lsof itself has no timeout
+# Where to look for lsof when c_lsof is unset or wrong. It sits in a different
+# place per OS, so this is a list, not a path.
+SETTLE_LSOF_SEARCH="/usr/sbin/lsof /usr/bin/lsof /opt/homebrew/bin/lsof /usr/local/bin/lsof"
+SETTLE_BACKUP_PATH=""              # "" = no backup copy of the raw delivery
+
+##### PROCESS (was: my-scan-processor-macos) ################################
+
+T_PATH_DONE="/CHANGEME/scans"
+T_PATH_FAILED="/CHANGEME/scans/02_FAILED_OCR"
+
+# Where a settled delivery waits while my-ocr works on it. There is no
+# "part 1" and "part 2" any more, so the old PART*_?_PATH names are gone:
+# a delivery is read from DROP_PATHS, waits here, and is filed in T_PATH_DONE.
+OCR_QUEUE_PATH="/CHANGEME/scans/01_scans_2ocr"
+
+# Accepted input, as the BEGINNING of `file --brief` output. A light check
+# only: my-ocr does the deep validation and knows more about it than my-scan
+# should.
+# What 'process' will hand to my-ocr. Pictures are fine: the OCR application
+# turns them into a searchable PDF, and my-ocr accepts the same set. Keep this
+# in step with my-ocr's S_EXPECTED_FILE_TYPE___REGEX -- a type accepted here
+# and refused there is a document that settles, stages, and then fails. Each of
+# these was tried against the real OCR application, not assumed: TIFF was added
+# only after FineReader was shown to accept one and return a searchable PDF.
+ACCEPT_FILE_TYPE_REGEX="JPEG \|PDF \|PNG \|TIFF "
+
+# Filenames matching these shell patterns skip OCR and go straight to DONE:
+NO_OCR_PATTERNS="no-ocr-scan*"
+
+##### OCR APPLICATION #######################################################
+
+# my-scan does not drive the OCR application -- my-ocr does. These two are
+# only so 'status' and 'setup' can say whether it is installed and running.
+# Languages, the producer tag, how to kill it: all my-ocr's business.
+OCRAPP_NAME="FineReader"
+OCRAPP_PATH="/Applications/FineReader.app"
+
+##### FOLDER ACTION / AUTOMATOR (used by 'setup') ###########################
+
+WORKFLOW_DIR="$HOME/Library/Workflows/Applications/Folder Actions"
+WORKFLOW_NAME="my-scan.workflow"
+# Shell for the workflow's Run Shell Script step. This is NOT my-scan's own
+# shell -- it is the one-line glue Automator runs, and Automator accepts only
+# the shells in its own list. /bin/dash is NOT one of them: the action then
+# does nothing at all, with no error and nothing in any log, so the Folder
+# Action looks dead. The command itself is POSIX and runs under any of them.
+# Automator offers exactly: /bin/bash /bin/csh /bin/ksh /bin/sh /bin/tcsh
+#   /bin/zsh /usr/bin/perl /usr/bin/ruby /usr/local/bin/python /usr/local/bin/python3
+WORKFLOW_SHELL="/bin/zsh"
+WORKFLOW_BACKUPS_KEEP=3            # older generated-workflow backups are pruned
+# 'status --watch' poll interval, seconds; fractions allowed (0.5). It must be
+# SHORTER than the briefest state you want to see: the quickest is settle, at
+# SETTLE_POLL x SETTLE_STABLE_POLLS (3s today), so 1s always catches it.
+# Transitions that are a single rename() have NO duration -- those are caught
+# as an appear/disappear pair, never by polling faster.
+WATCH_INTERVAL=1
+# Seconds a 'process' run waits for another run to finish claiming files out of
+# the drop folder. Staging is quick; this only has to outlast a big backlog.
+STAGE_LOCK_TIMEOUT=300
+
+# How many PAGES my-scan hands to my-ocr in one call. Pages, not files: ten
+# one-page receipts and ten 200-page contracts are the same file count and
+# wildly different work, so a file count bounds nothing.
+#
+# my-ocr holds the OCR mutex for a whole call, so this is what bounds how long
+# anything else -- a CLI 'my-ocr <file>', a scan that just arrived -- waits for
+# its turn. Smaller means a shorter wait and more FineReader round trips; each
+# round trip costs ~25s of fixed overhead whatever the page count.
+#   0 or empty = no limit (one call for everything, the old behaviour)
+OCR_BATCH_MAX_PAGES=25
+
+# Counting pages costs a pdfinfo per document (~25ms). Worth it for a queue,
+# not for a backlog: above this many files 'status' reports documents only and
+# leaves the page count to -V.
+PAGE_COUNT_MAX_FILES=40
+
+# osascript has no timeout of its own. The first System Events call from a new
+# caller raises the Automation consent dialog ON THE CONSOLE, and osascript
+# waits on it for ever -- so over ssh, or from a LaunchDaemon, setup hangs with
+# no clue why. Bound it, but generously: a person may have to walk to the
+# machine to click Allow.
+OSASCRIPT_TIMEOUT=180              # seconds for one System Events call
+# Path the generated workflow uses to call this tool. Must be stable and
+# readable by the GUI user.
+WORKFLOW_MY_SCAN="/LINKS/bin/my-scan"
+
+##### EXTERNAL COMMANDS #####################################################
+
+# my-scan hands every OCR to my-ocr, which owns FineReader, its Automator
+# wiring and the mutex that keeps exactly one OCR running at a time.
+MY_OCR="/LINKS/bin/my-ocr"
+
+c_trash="/usr/local/bin/trash"
+c_convert="/usr/local/bin/convert"
+c_identify="/usr/local/bin/identify"
+c_pdfinfo="/usr/local/bin/pdfinfo"
+c_lsof="/usr/sbin/lsof"
+# -b -w: no blocking kernel calls, no warnings.  -n -P: no host/port lookups.
+# Without these lsof can hang for minutes on an unresponsive mount.
+c_lsof_opts="-b -w -n -P"
+
+_EOCONF_
+}
+
+config_search_list() {
+  _p "/LINKS/default/my-scan"
+  _p "$HOME/.my-scan.conf"
+  _p "/etc/my-scan.conf"
+  _p "/usr/local/etc/my-scan.conf"
+}
+
+load_config() {
+  CONFIG_SOURCE=
+
+  if [ -n "$MY_SCAN_CONFIG" ]; then
+    CONFIG_FILE="$MY_SCAN_CONFIG"; CONFIG_SOURCE="\$MY_SCAN_CONFIG"
+  elif [ -n "$CONFIG" ]; then
+    CONFIG_FILE="$CONFIG"; CONFIG_SOURCE="--config"
+  else
+    CONFIG_FILE=""
+    _tmp="$(config_search_list)"
+    while IFS= read -r _cand; do
+      [ -z "$_cand" ] && continue
+      if [ -r "$_cand" ]; then CONFIG_FILE="$_cand"; CONFIG_SOURCE="search"; break; fi
+    done <<_EOCS_
+$_tmp
+_EOCS_
+  fi
+
+  if [ -z "$CONFIG_FILE" ]; then
+    _p "No config file found. Searched, in order:" 1>&2
+    indent "$(config_search_list)" "    > " 1>&2
+    _p "" 1>&2
+    _p "Create one with:  $US --create-config /LINKS/default/my-scan" 1>&2
+    exit 2
+  fi
+  [ -r "$CONFIG_FILE" ] || err 001 "Config file '$CONFIG_FILE' is not readable."
+
+  # POSIX '.' SEARCHES $PATH when the operand contains no slash, so a config
+  # named on the command line as a bare filename would be looked for in $PATH
+  # and not found. Make it unambiguously a path.
+  case "$CONFIG_FILE" in */*) _cf="$CONFIG_FILE";; *) _cf="./$CONFIG_FILE";; esac
+  # shellcheck disable=SC1090  # path is resolved at runtime by the search above
+  . "$_cf" || err 002 "FAILED to source config file '$CONFIG_FILE'."
+  dbg "config: '$CONFIG_FILE' (via $CONFIG_SOURCE)"
+
+  [ -n "$NO_LOG" ] && LOG=""
+  validate_config
+  return 0
+}
+
+# A config from an older version is missing the newer keys. Unset, a numeric
+# one silently turns its "while [ $i -lt $KEY ]" into a spin loop, so check
+# them here rather than discovering it as a hang.
+validate_config() {
+  _missing=""
+  for _k in SETTLE_TIMEOUT SETTLE_POLL SETTLE_STABLE_POLLS SETTLE_LSOF_TIMEOUT \
+           OSASCRIPT_TIMEOUT; do
+    eval "_v=\$$_k"
+    if [ -z "$_v" ]; then _missing="$_missing $_k(unset)"
+    elif ! isInt "$_v"; then _missing="$_missing $_k=\"$_v\"(not a number)"; fi
+  done
+  # SCAN_DEVICE_USUALLY_OFF is deliberately allowed to be empty (= "no")
+  for _k in OCR_QUEUE_PATH T_PATH_DONE T_PATH_FAILED SETTLE_WRITER_PROCS MY_OCR; do
+    # c_lsof is deliberately NOT required: empty means "autodetect", which is
+    # how it works across OSes.
+    eval "_v=\$$_k"
+    [ -z "$_v" ] && _missing="$_missing $_k(unset)"
+  done
+
+  [ -z "$_missing" ] && return 0
+  err 077 "Config '$CONFIG_FILE' is missing or malformed:$_missing
+--> It was probably written for an older version. Compare it against a fresh
+    default:  $US --create-config | diff - '$CONFIG_FILE'"
+}
+
+do_create_config() {
+  if [ -z "$CREATE_CONFIG_FILE" ]; then
+    _default_config_content
+    return 0
+  fi
+  [ -e "$CREATE_CONFIG_FILE" ] && err 003 "Refusing to overwrite existing '$CREATE_CONFIG_FILE'."
+  _default_config_content >"$CREATE_CONFIG_FILE" \
+    || err 004 "FAILED to write '$CREATE_CONFIG_FILE'."
+  msg "Wrote default config to '$CREATE_CONFIG_FILE'"
+  det "edit it before use: DROP_PATHS and PART1_S_PATH still say CHANGEME"
+  return 0
+}
+
+
+##############################################################################
+#### VERSION
+
+build_id() {
+  _h="$(shasum -a 256 "$0" 2>/dev/null | cut -c1-12)"
+  [ -z "$_h" ] && _h="unknown"
+  _p "$_h"
+}
+
+do_version() {
+  _bid="$(build_id)"
+  if [ -n "$SCRIPT_COMMIT" ]; then
+    _p "$US $SCRIPT_VERSION (commit $SCRIPT_COMMIT, build $_bid)"
+  else
+    _p "$US $SCRIPT_VERSION (build $_bid, unstamped)"
+  fi
+}
+
+do_stamp_version() {
+  _dir="$(cd "$(dirname "$0")" && pwd)" || err 005 "Cannot resolve own directory."
+  git -C "$_dir" rev-parse --git-dir >/dev/null 2>&1 \
+    || err 006 "Not inside a git checkout -- nothing to stamp."
+
+  # refuse when any OTHER file is dirty: the --amend would swallow it
+  _other="$(git -C "$_dir" status --porcelain -- . | grep -v " $US\$" | grep -v "/$US\$")"
+  [ -n "$_other" ] && { indent "$_other" "    > " 1>&2
+                        err 007 "Other files are dirty; commit or stash them first."; }
+
+  # refuse to amend an already-published commit
+  if git -C "$_dir" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+    git -C "$_dir" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null \
+      && err 008 "HEAD is already pushed -- amending it would rewrite published history."
+  fi
+
+  _sha="$(git -C "$_dir" rev-parse --short HEAD)" || err 009 "git rev-parse HEAD failed."
+  if [ "$SCRIPT_COMMIT" = "$_sha" ]; then
+    msg "Already stamped with commit $_sha -- nothing to do."
+    return 0
+  fi
+
+  _tmp="$0.stamp.$$"
+  sed -e "s|^SCRIPT_COMMIT=\".*\"|SCRIPT_COMMIT=\"$_sha\"|" "$0" >"$_tmp" \
+    || { rm -f "$_tmp"; err 010 "FAILED to rewrite SCRIPT_COMMIT."; }
+  grep -q "^SCRIPT_COMMIT=\"$_sha\"" "$_tmp" \
+    || { rm -f "$_tmp"; err 011 "SCRIPT_COMMIT line not found -- refusing to install."; }
+
+  _mode="$(/usr/bin/stat -f '%Lp' "$0")" || _mode=750
+  if ! { chmod "$_mode" "$_tmp" && mv -f "$_tmp" "$0"; }; then
+    rm -f "$_tmp"; err 012 "FAILED to install."
+  fi
+
+  run git -C "$_dir" add -- "$US" || err 013 "git add failed."
+  run git -C "$_dir" commit --amend --no-edit || err 014 "git commit --amend failed."
+
+  msg "Stamped $US with commit $_sha [$(build_id)]"
+  det "the stamped sha lags HEAD by one: amending changes the sha. That is expected;"
+  det "do not 'fix' it. The build id above identifies these exact bytes."
+  return 0
+}
+
+
+##############################################################################
+#### SETTLE -- a file is complete and safe to pick up
+##
+## Three independent checks, each covering the others' blind spot:
+##   1. no writer among SETTLE_WRITER_PROCS holds a write descriptor (SMB/FTP)
+##   2. the size is unchanged across SETTLE_STABLE_POLLS polls
+##   3. the file parses (pdfinfo / identify)
+
+# Exact bytes, and identical on every OS. 'du' counts 512-byte blocks on BSD
+# and 1024-byte blocks on GNU, so the same file appears to change size merely
+# by changing machine -- which is poison for a size-stability check.
+file_size() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+
+# BSD stat and GNU stat share no flags at all for this.
+file_mtime() { # -> epoch seconds
+  case "$MY_OS" in
+    Darwin|*BSD*) /usr/bin/stat -f %m "$1" 2>/dev/null ;;
+    *)            stat -c %Y "$1" 2>/dev/null ;;
+  esac
+}
+
+# lsof lives in a different place per OS, and on some minimal systems not at
+# all. Never fall through silently: without it the writer check is gone and
+# only size-stability and the parse check are carrying the file.
+find_lsof() {
+  { [ -n "$c_lsof" ] && [ -x "$c_lsof" ]; } && return 0
+
+  # An explicitly configured path that does not work is a mistake worth
+  # naming, not something to quietly paper over by finding another one.
+  if [ -n "$c_lsof" ] && [ -z "$LSOF_WARNED" ]; then
+    err 079 "c_lsof '$c_lsof' is not executable -- searching the usual places instead." "-"
+  fi
+
+  for _c in $SETTLE_LSOF_SEARCH; do
+    [ -x "$_c" ] && c_lsof="$_c" && return 0
+  done
+  c_lsof="$(command -v lsof 2>/dev/null)"
+  { [ -n "$c_lsof" ] && [ -x "$c_lsof" ]; } && return 0
+  if [ -z "$LSOF_WARNED" ]; then
+    LSOF_WARNED=1
+    err 078 "lsof not found on $MY_OS -- the SMB/FTP writer check is DISABLED.
+Settling now rests on size-stability and the parse check alone, which is
+weaker. Install lsof, or set c_lsof in the config." "-"
+  fi
+  return 1
+}
+
+# shellcheck disable=SC2154  # set by the sourced config file
+settle_writer_busy() { # $1 = file. 0 = a writer still holds it.
+  find_lsof || return 1
+
+  # lsof can block for minutes on an unresponsive mount, and it has no timeout
+  # of its own. Unbounded here it would wedge the whole Folder Action, so run
+  # it detached and kill it if it overruns. $c_lsof_opts carries -b -w -n -P:
+  # no blocking kernel calls, no host or port lookups.
+  _lsof_out="$(mktemp /tmp/my-scan.lsof.XXXXXX)" || return 1
+  # shellcheck disable=SC2086  # a deliberate list of lsof options
+  "$c_lsof" $c_lsof_opts -- "$1" >"$_lsof_out" 2>/dev/null &
+  _lsof_pid=$!
+  _lsof_max="$SETTLE_LSOF_TIMEOUT"
+  isInt "$_lsof_max" || _lsof_max=10
+  _w=0
+  while kill -0 "$_lsof_pid" 2>/dev/null; do
+    [ "$_w" -ge "$_lsof_max" ] && break
+    sleep 1
+    _w=$(( _w + 1 ))
+  done
+  if kill -0 "$_lsof_pid" 2>/dev/null; then
+    kill -9 "$_lsof_pid" 2>/dev/null
+    rm -f "$_lsof_out"
+    # never silently: an unusable writer check means the size-stability and
+    # parse checks are carrying this file on their own
+    err 076 "lsof did not answer within ${SETTLE_LSOF_TIMEOUT}s for '$1' -- \
+skipping the writer check, relying on size-stability and parse" "-"
+    return 1
+  fi
+  wait "$_lsof_pid" 2>/dev/null
+
+  _busy="$(awk -v procs="$SETTLE_WRITER_PROCS" '
+      NR == 1 { next }
+      $4 !~ /^[0-9]+[uw]$/ { next }
+      { n = split(procs, p, " ");
+        for (i = 1; i <= n; i++) if ($1 == p[i]) { print; next } }' "$_lsof_out")"
+  rm -f "$_lsof_out"
+
+  [ -n "$_busy" ] || return 1
+  ddbg "settle: writer still holds '$1':"
+  [ "$DEEPDBG" = "1" ] && indent "$_busy" "   ~ | " 1>&2
+  return 0
+}
+
+# shellcheck disable=SC2154  # set by the sourced config file
+settle_parses() { # $1 = file. 0 = parses as a type we accept.
+  _type="$(file --brief "$1" 2>/dev/null | cut -f1 -d' ')"
+  case "$_type" in
+    PDF)  "$c_pdfinfo" "$1" >/dev/null 2>&1; return $? ;;
+    JPEG|PNG|TIFF)
+          if [ -x "$c_identify" ]; then "$c_identify" "$1" >/dev/null 2>&1; return $?
+          else "$c_convert" "$1" -print '' /dev/null >/dev/null 2>&1; return $?; fi ;;
+    *)    ddbg "settle: '$1' has type '$_type' -- no parser, treating as parsed"
+          return 0 ;;
+  esac
+}
+
+# shellcheck disable=SC2154  # set by the sourced config file
+# THE three checks, in one place. Both the waiter (process) and the
+# reporter (status -V) go through here, so they can never drift apart or word
+# the same condition differently.
+#   $1 = file, $2 = size seen on the previous look ("" if none)
+# Sets SETTLE_SIZE and SETTLE_REASON; returns 0 only when all three pass.
+settle_check() {
+  _sc_f="$1"; _sc_prev="$2"
+  if [ ! -e "$_sc_f" ]; then SETTLE_SIZE=""; SETTLE_REASON="vanished"; return 1; fi
+  SETTLE_SIZE="$(file_size "$_sc_f")"
+
+  if settle_writer_busy "$_sc_f"; then
+    SETTLE_REASON="an SMB/FTP writer still holds it"; return 1
+  fi
+  if [ -z "$_sc_prev" ] || [ "$_sc_prev" != "$SETTLE_SIZE" ]; then
+    SETTLE_REASON="still growing (${_sc_prev:-?} -> $SETTLE_SIZE bytes)"; return 1
+  fi
+  if ! settle_parses "$_sc_f"; then
+    SETTLE_REASON="size steady but it does not parse yet"; return 1
+  fi
+  SETTLE_REASON="settled"
+  return 0
+}
+
+# WAIT until settled. Used by process, which must not touch a delivery
+# that is still arriving.
+settle_file() { # $1 = file. 0 = settled, 1 = timed out.
+  _f="$1"; _i=0; _stable=0; _last=""
+  dbg "settle_file('$_f'): timeout=${SETTLE_TIMEOUT}s poll=${SETTLE_POLL}s stable=${SETTLE_STABLE_POLLS}"
+  vdet "waiting until no SMB/FTP writer holds it, its size stops changing, and it parses"
+
+  while [ "$_i" -lt "$SETTLE_TIMEOUT" ]; do
+    if settle_check "$_f" "$_last"; then
+      # one pass is not enough: process wants the size steady for N looks
+      _stable=$(( _stable + 1 ))
+      if [ "$_stable" -ge "$SETTLE_STABLE_POLLS" ]; then
+        vdet "settled after ${_i}s (size $SETTLE_SIZE bytes, stable ${_stable}x, parses)"
+        return 0
+      fi
+    else
+      _stable=0
+      [ "$SETTLE_REASON" = "vanished" ] && return 1
+    fi
+    _last="$SETTLE_SIZE"
+    ddbg "settle [$_i/$SETTLE_TIMEOUT] '$_f': $SETTLE_REASON"
+    sleep "$SETTLE_POLL"
+    _i=$(( _i + SETTLE_POLL ))
+  done
+
+  err 015 "TIMEOUT [${SETTLE_TIMEOUT}s] settling '$_f' -- $SETTLE_REASON" "-"
+  return 1
+}
+
+# Why a report and not a 'settle' subcommand: "is this delivery stuck?" is a
+# question about the pipeline, and status is where pipeline questions belong.
+# It must never block, so it samples every file, sleeps ONCE, and re-samples --
+# about a second in total however many files there are, not a second each.
+settle_report() { # $1 = directory, $2 = line prefix
+  _sr_dir="$1"; _sr_pfx="$2"
+  [ -d "$_sr_dir" ] || return 0
+  _sr_list="$(find "$_sr_dir" -mindepth 1 -maxdepth 1 -type f 2>/dev/null)"
+  [ -z "$_sr_list" ] && return 0
+
+  # REPORT only -- never waits. One sleep for the whole listing, because size
+  # stability cannot be judged from a single observation.
+  _sr_snap="$(mktemp /tmp/my-scan.settle.XXXXXX)" || return 0
+  while IFS= read -r _sr_f; do
+    [ -z "$_sr_f" ] && continue
+    printf '%s\t%s\n' "$_sr_f" "$(file_size "$_sr_f")" >>"$_sr_snap"
+  done <<_EOSR1_
+$_sr_list
+_EOSR1_
+
+  sleep "$SETTLE_POLL"
+
+  while IFS="$TAB" read -r _sr_f _sr_prev; do
+    [ -z "$_sr_f" ] && continue
+    if settle_check "$_sr_f" "$_sr_prev"; then _sr_v="settled -- ready for pickup"
+    else                                      _sr_v="WAITING: $SETTLE_REASON"; fi
+    _p "${_sr_pfx}| $(printf '%-34s %9s b  %s' "${_sr_f##*/}" "${SETTLE_SIZE:-0}" "$_sr_v")"
+  done <<_EOSR2_
+$(cat "$_sr_snap")
+_EOSR2_
+  rm -f "$_sr_snap"
+}
+
+settle_backup() { # $1 = file
+  [ -n "$SETTLE_BACKUP_PATH" ] || return 0
+  _bkp="$SETTLE_BACKUP_PATH/$(date +"%Y-%m-%d_%H%M.%S")___$$"
+  mkdir -p "$_bkp" || { err 016 "FAILED to create backup dir '$_bkp'" "-"; return 1; }
+  run rsync -axSH "$1" "$_bkp/" || { err 017 "FAILED to back up '$1' to '$_bkp/'" "-"; return 1; }
+  vdet "kept a copy of the raw delivery in '$_bkp/'"
+  return 0
+}
+
+##############################################################################
+#### NAMING
+
+
+determine_T_INP() { # sets T_INP from $INP / $S_INP / $T_PATH
+  _inp="$INP"
+  ddbg "determine_T_INP(): inp='$_inp'"
+
+  _tmp="$(printf '%s\n' "$_inp" | sed -n 's/^\([123][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]\)_.*/\1/p')"
+  if [ -n "$_tmp" ]; then
+    ddbg "starts with a date ($_tmp) -- leaving the name as it is"
+  else
+    _tmp="$(printf '%s\n' "$_inp" | sed -n 's/^[123][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]_[0-2][0-9][0-5][0-9].[0-5][0-9]___//p')"
+    if [ -n "$_tmp" ]; then
+      ddbg "starts with a full timestamp -- stripping it: '$_tmp'"
+      _inp="$_tmp"
+    fi
+    _mtime="$(file_mtime "$S_INP")"
+    [ -z "$_mtime" ] && err 021 "Could not read the mtime of '$S_INP' on $MY_OS."
+    _newdate="$(date -r "$_mtime" +"%Y-%m-%d_%H%M.%S")" || err 022 "date -r '$_mtime' failed."
+    ddbg "mtime $_mtime -> '$_newdate'"
+    _inp="${_newdate}___${_inp}"
+  fi
+
+  _base="${_inp%.*}"
+  _suff="${_inp##*.}"
+
+  # drop an ID from an earlier run, and any character that breaks the OCR app
+  _base="$(printf '%s\n' "$_base" | sed -e "s|___,ID,[0-9][0-9]*$||" -e "s|[[:space:]]|_|g")"
+
+  # No "___,ID,<pid>" any more: that existed only so part-2 could find the
+  # run that part-1 had started. my-ocr owns the OCR now, so the name the
+  # document is given here is the name it keeps.
+  T_INP="$T_PATH/${_base}.$_suff"
+
+  if [ -e "$T_INP" ]; then
+    for _i in 1 2 3 4 5 6 7 8 9; do
+      T_INP="$T_PATH/${_base}___$_i.$_suff"
+      ddbg "T_INP exists -- trying '$T_INP'"
+      [ ! -e "$T_INP" ] && break
+    done
+  fi
+  [ -e "$T_INP" ] && err 023 "Unable to determine a free T_INP for '$_inp'."
+
+  pe "  >  Determined T_INP as '$T_INP'."
+}
+
+
+
+
+
+
+
+
+
+##############################################################################
+#### PROCESS -- receive a delivery and hand the OCR to my-ocr
+##
+## my-scan settles, names and files. my-ocr does the OCR: it owns FineReader,
+## its Automator wiring and the mutex, so it BLOCKS until its turn and no
+## caller has to arrange not to collide. That is why there is no lockfile, no
+## part-1/part-2 split and no watchdog here any more.
+
+# Move $S_INP to $T_PATH under its final name. Sets T_INP.
+# shellcheck disable=SC2154  # set by the sourced config file
+stage_file() {
+  determine_T_INP || return 1
+  cp "$S_INP" "$T_INP"  || { pe " >>> FAILED [$?] to cp '$S_INP' '$T_INP'";  return 1; }
+  "$c_trash" "$S_INP"   || { pe " >>> FAILED [$?] to trash '$S_INP'";        return 1; }
+  chmod 660 "$T_INP" 2>/dev/null
+  pe "  >  '$S_INP' -> '$T_INP'"
+  return 0
+}
+
+# Leftovers that nothing will ever pick up on its own, oldest first.
+#   queue  = staged but never OCRed (a crashed or killed run)
+#   failed = my-ocr tried and could not
+# They are kept apart on purpose: a stranded file is almost always fine to
+# retry, while a FAILED one already defeated the OCR once and re-feeding the
+# whole folder blindly just repeats the failure. So --retry means the queue,
+# and the failed ones need saying so.
+retry_files() { # $1 = queue|failed|all
+  # '! -name .*' matters: the queue also holds Finder droppings (.DS_Store) and
+  # my-ocr's own dot-prefixed sidecars, and neither is a document to re-OCR.
+  case "${1:-queue}" in
+    queue|all)
+      [ -d "$OCR_QUEUE_PATH" ] && find "$OCR_QUEUE_PATH" -mindepth 1 -maxdepth 1 \
+        -type f ! -name '.*' 2>/dev/null
+      ;;
+  esac | sort
+  case "${1:-queue}" in
+    failed|all)
+      [ -d "$T_PATH_FAILED" ] && find "$T_PATH_FAILED" -mindepth 1 -maxdepth 1 \
+        -type f ! -name '.*' 2>/dev/null
+      ;;
+  esac | sort
+}
+
+# Claiming files out of a drop folder must not happen twice at once. Two runs
+# overlap for real: a backlog drain ('process --all') while a new scan fires
+# its own Folder Action. Both would read the same pending list and stage the
+# same document under two timestamps -- OCRed twice, one copy left stranded.
+#
+# The lock covers STAGING ONLY. Once a file has been moved out of the drop
+# folder it is uniquely claimed, so OCR and filing need no lock here -- my-ocr's
+# own mutex serialises FineReader.
+stage_lock_acquire() {
+  _sl_d="$OCR_QUEUE_PATH/.my-scan.staging.lock"
+  _sl_i=0
+  until mkdir "$_sl_d" 2>/dev/null; do
+    _sl_o="$(cat "$_sl_d/owner" 2>/dev/null)"
+    _sl_p="${_sl_o#pid=}"; _sl_p="${_sl_p%% *}"
+    # break ONLY a provably dead owner, and never silently
+    if [ -n "$_sl_p" ] && ! kill -0 "$_sl_p" 2>/dev/null; then
+      pe " >>> breaking stale staging lock: owner $_sl_p is gone ($_sl_o)"
+      rm -f "$_sl_d/owner"; rmdir "$_sl_d" 2>/dev/null
+      continue
+    fi
+    _sl_i=$(( _sl_i + 1 ))
+    [ "$_sl_i" -eq 1 ] && pe " >>> another '$US process' is staging (${_sl_o:-unknown}) -- waiting..."
+    if [ "$_sl_i" -gt "$STAGE_LOCK_TIMEOUT" ]; then
+      err 082 "TIMEOUT [${_sl_i}s] waiting for the staging lock '$_sl_d' (held by ${_sl_o:-unknown})." "-"
+      return 1
+    fi
+    sleep 1
+  done
+  printf 'pid=%s at=%s\n' "$$" "$(date -u +%FT%TZ)" > "$_sl_d/owner"
+  WE_HOLD_STAGE_LOCK=1
+  return 0
+}
+stage_lock_release() {
+  [ "$WE_HOLD_STAGE_LOCK" = "1" ] || return 0
+  rm -f "$OCR_QUEUE_PATH/.my-scan.staging.lock/owner"
+  rmdir "$OCR_QUEUE_PATH/.my-scan.staging.lock" 2>/dev/null
+  WE_HOLD_STAGE_LOCK=""
+  return 0
+}
+
+# Pages in one document. A picture is one page; anything we cannot read counts
+# as one too -- guessing high would starve a batch, guessing zero would let an
+# unbounded document slip into it.
+page_count() { # $1 = file
+  case "$(file --brief "$1" 2>/dev/null | cut -f1 -d' ')" in
+    PDF)
+      _pc="$("$c_pdfinfo" "$1" 2>/dev/null | awk '/^Pages:/{print $2; exit}')"
+      case "$_pc" in ''|*[!0-9]*) _pc=1 ;; esac
+      printf '%s\n' "$_pc" ;;
+    *) printf '1\n' ;;
+  esac
+}
+
+# "<documents>/<pages>" for a directory, or "<documents>" alone when counting
+# pages would cost more than the answer is worth.
+count_docs_pages() { # $1 = dir
+  _cdp_n="$(count_files "$1")"
+  if [ "$_cdp_n" = "0" ]; then printf 'empty\n'; return 0; fi
+  _lim="$PAGE_COUNT_MAX_FILES"; isInt "$_lim" || _lim=40
+  if [ "$_cdp_n" -gt "$_lim" ] && [ "$VRB" != "1" ]; then
+    printf '%s documents (-V counts the pages)\n' "$_cdp_n"; return 0
+  fi
+  _cdp_p=0
+  _cdp_t="$(mktemp /tmp/my-scan.pages.XXXXXX)" || { printf '%s documents\n' "$_cdp_n"; return 0; }
+  find "$1" -mindepth 1 -maxdepth 1 -type f ! -name '.*' 2>/dev/null >"$_cdp_t"
+  while IFS= read -r _cdp_f; do
+    [ -n "$_cdp_f" ] || continue
+    _cdp_p=$(( _cdp_p + $(page_count "$_cdp_f") ))
+  done <"$_cdp_t"
+  rm -f "$_cdp_t"
+  printf '%s documents / %s pages\n' "$_cdp_n" "$_cdp_p"
+}
+
+# Everything sitting in a drop folder, oldest first -- that is the order they
+# were scanned in, and the order you would want them OCRed.
+pending_files() {
+  for _pd in $DROP_PATHS; do
+    [ -d "$_pd" ] || continue
+    find "$_pd" -mindepth 1 -maxdepth 1 -type f 2>/dev/null
+  done | sort
+}
+
+# my-ocr replaces each original IN PLACE on success and moves what it could not
+# OCR to T_PATH_FAILED. So whatever is still in the list now is an OCRed file,
+# ready to be filed. Shared by 'process' and 'process --retry' so the two
+# cannot drift apart.
+# The '_fr_' prefix is not decoration: this runs INSIDE ocr_in_chunks' own
+# read loop, and a shared variable name here silently ate a document from the
+# next chunk -- the loop appended a value this function had overwritten.
+file_ocred_results() { # $1 = newline-separated staged paths
+  while IFS= read -r _fr_f; do
+    [ -z "$_fr_f" ] && continue
+    [ -e "$_fr_f" ] || continue                    # my-ocr moved it out
+    _fr_final="$T_PATH_DONE/${_fr_f##*/}"
+    if [ -e "$_fr_final" ]; then
+      _fr_final="$T_PATH_DONE/$(date +%Y-%m-%d_%H%M.%S)___${_fr_f##*/}"
+    fi
+    if mv "$_fr_f" "$_fr_final"; then
+      FILES_OCRED_CNT=$(( FILES_OCRED_CNT + 1 ))
+      pe "  >  filed '$_fr_final'"
+    else
+      err 070 "FAILED [$?] to file '$_fr_f' -> '$_fr_final'" "-"
+    fi
+  done <<_EOFI_
+$1
+_EOFI_
+  return 0
+}
+
+# Hand files to my-ocr in chunks of at most OCR_BATCH_MAX_PAGES pages.
+#
+# my-ocr holds the OCR mutex for the whole call, so one unbounded call means
+# anything else waits for the entire backlog. Chunking releases the mutex
+# between chunks, which is what bounds that wait. A document larger than the
+# cap still goes on its own -- never starved, just alone.
+ocr_in_chunks() { # $1 = newline-separated staged paths
+  _cap="$OCR_BATCH_MAX_PAGES"
+  isInt "$_cap" || _cap=0
+  _chunk=""; _chunk_pages=0; _chunk_no=0
+  _oc_t="$(mktemp /tmp/my-scan.chunk.XXXXXX)" || { _chunk="$1"; ocr_one_chunk; return 0; }
+  printf '%s\n' "$1" >"$_oc_t"
+  while IFS= read -r _oc_f; do
+    [ -n "$_oc_f" ] || continue
+    _fp=1
+    [ "$_cap" -gt 0 ] && _fp="$(page_count "$_oc_f")"
+    # flush first when this file would push us over -- but never emit an
+    # empty chunk, so an oversized document still gets its own run
+    if [ "$_cap" -gt 0 ] && [ -n "$_chunk" ] \
+       && [ $(( _chunk_pages + _fp )) -gt "$_cap" ]; then
+      ocr_one_chunk
+      _chunk=""; _chunk_pages=0
+    fi
+    _chunk="${_chunk}${_chunk:+$NL}$_oc_f"
+    _chunk_pages=$(( _chunk_pages + _fp ))
+  done <"$_oc_t"
+  rm -f "$_oc_t"
+  [ -n "$_chunk" ] && ocr_one_chunk
+  return 0
+}
+
+ocr_one_chunk() {
+  _chunk_no=$(( _chunk_no + 1 ))
+  _cn="$(printf '%s\n' "$_chunk" | awk 'NF{n++} END{print n+0}')"
+  if [ "$_cap" -gt 0 ]; then
+    pe "  >  chunk $_chunk_no: $_cn file(s), $_chunk_pages page(s) (cap $_cap)"
+  fi
+  set -- "$MY_OCR" --move-failed-to "$T_PATH_FAILED"
+  while IFS= read -r _cf; do [ -n "$_cf" ] && set -- "$@" "$_cf"; done <<_EOCH_
+$_chunk
+_EOCH_
+  if "$@"; then
+    pe "  >  $MY_OCR finished [0]"
+  else
+    err 069 "$MY_OCR failed [$?] -- see its own log; files it could not OCR are in '$T_PATH_FAILED'." "-"
+  fi
+  file_ocred_results "$_chunk"
+  return 0
+}
+
+# Retry: the files are already staged and named, so this is my-ocr plus the
+# filing step -- no settle, no rename. Anything my-ocr still cannot do lands
+# back in FAILED, so a retry can be repeated without making a mess.
+do_retry_batch() {
+  _rb_n="$(printf '%s\n' "$INP_FILES" | awk 'NF{n++} END{print n+0}')"
+  pe " >>> RETRY: handing $_rb_n file(s) back to my-ocr"
+  mkdir -p "$OCR_QUEUE_PATH" 2>/dev/null
+  # move FAILED ones back into the queue first: that is where my-ocr's caller
+  # contract says work lives, and it keeps one code path for both sources.
+  _rb_list=""
+  printf '%s\n' "$INP_FILES" | while IFS= read -r _rf; do
+    [ -n "$_rf" ] || continue
+    case "$_rf" in
+      "$T_PATH_FAILED"/*)
+        _rt="$OCR_QUEUE_PATH/${_rf##*/}"
+        if mv "$_rf" "$_rt" 2>/dev/null; then pe "  >  requeued '${_rf##*/}'"
+        else pe "  >  FAILED to requeue '${_rf##*/}'"; fi ;;
+    esac
+  done
+  # re-read: the moves above happened in a subshell
+  INP_FILES="$(retry_files queue)"
+  _rb_list="$INP_FILES"
+  [ -z "$_rb_list" ] && { pe " >>> nothing left to retry."; return 0; }
+
+  ocr_in_chunks "$_rb_list"
+  pe ""
+  pe "$(date +"%Y-%m-%d_%H%M.%S") RETRY DONE -- $FILES_OCRED_CNT filed."
+  return 0
+}
+
+do_process() {
+  [ -x "$c_trash" ]   || err 064 "NOT FOUND: '$c_trash' (brew install trash)"
+  [ -x "$c_pdfinfo" ] || err 066 "NOT FOUND: '$c_pdfinfo' (brew install poppler)"
+  [ -x "$MY_OCR" ]    || err 067 "NOT FOUND: '$MY_OCR' -- my-scan hands every OCR to it."
+
+  # The LOG redirect happens only once we are actually going to DO something.
+  # A listing is a question the user asked at a terminal; answering it into a
+  # logfile they cannot see is the same as not answering.
+  process_start_log() {
+    if [ -n "$LOG" ]; then
+      mkdir -p "${LOG%/*}" 2>/dev/null
+      exec 3<&1 && exec 1>>"$LOG" && exec 2>&1
+      LOG_IS_STDERR=1
+    else
+      exec 3<&1
+    fi
+    NOW="$(date +"%Y-%m-%d_%H%M.%S")"
+    echo; pe ""
+  }
+
+  # Three ways in:
+  #   --all        -> everything pending in the drop folders (backlog recovery)
+  #   stdin        -> exactly those files (what the Folder Action pipes in)
+  #   neither      -> LIST what is pending and change nothing, so 'process'
+  #                   on its own is a question, never an accident
+  if [ -n "$PROCESS_RETRY" ]; then
+    [ -n "$PROCESS_ALL" ] && process_start_log
+    # A file here is already settled, named and staged, so it goes straight to
+    # my-ocr -- re-settling a file my-scan itself placed would be nonsense.
+    INP_FILES="$(retry_files "$PROCESS_RETRY")"
+    if [ -z "$INP_FILES" ]; then
+      pe " >>> nothing to retry ($PROCESS_RETRY)."
+      exit 0
+    fi
+    if [ -z "$PROCESS_ALL" ]; then
+      pe " >>> RETRY -- these would be handed to my-ocr again ($PROCESS_RETRY):"
+      printf '%s\n' "$INP_FILES" | while IFS= read -r _rf; do
+        [ -n "$_rf" ] && pe "  >  ${_rf##*/}"
+      done
+      case "$PROCESS_RETRY" in
+        queue) _rh="";;
+        *)     _rh=" $PROCESS_RETRY";;
+      esac
+      pe " >>> nothing done -- add --all to retry them:  $US process --retry$_rh --all"
+      exit 0
+    fi
+    do_retry_batch
+    exit $?
+  fi
+
+  # Decide the mode BEFORE the log redirect: with no work to do this is a
+  # listing, and a listing must answer on the terminal.
+  # claim under the lock, so two runs cannot take the same document
+  mkdir -p "$OCR_QUEUE_PATH" 2>/dev/null
+  stage_lock_acquire || return 1
+  if [ -n "$PROCESS_ALL" ]; then
+    INP_FILES="$(pending_files)"
+  else
+    INP_FILES="$(collect_inputs)"
+  fi
+  [ -z "$INP_FILES" ] && stage_lock_release
+
+  if [ -n "$INP_FILES" ]; then
+    process_start_log
+  fi
+
+  if [ -n "$PROCESS_ALL" ]; then
+    [ -z "$INP_FILES" ] && { _p "Nothing pending in: $DROP_PATHS"; return 0; }
+    pe "--all: taking everything pending"
+  else
+    if [ -z "$INP_FILES" ]; then
+      _pend="$(pending_files)"
+      if [ -z "$_pend" ]; then
+        pe "Nothing pending in: $DROP_PATHS"
+      else
+        _pn="$(printf '%s\n' "$_pend" | wc -l | tr -d ' ')"
+        pe "$_pn file(s) pending:"
+        printf '%s\n' "$_pend" | while IFS= read -r _pf; do
+          [ -n "$_pf" ] && pe "  | ${_pf##*/}"
+        done
+        pe ""
+        pe "nothing processed -- '$US process --all' to take them all,"
+        pe "or pipe a subset:  ls -1d <dir>/* | head -10 | $US process"
+        pe "'$US -V status' says why a file is not settled yet."
+      fi
+      # no log was opened for a listing, so there is nothing to unwind
+      return 0
+    fi
+  fi
+  INP_FILES_CNT="$(printf '%s\n' "$INP_FILES" | wc -l | tr -d ' ')"
+  pe "$NOW Got $INP_FILES_CNT file(s)."
+
+  T_PATH="$OCR_QUEUE_PATH"
+  mkdir -p "$T_PATH" "$T_PATH_DONE" "$T_PATH_FAILED" 2>/dev/null
+
+  _staged=""          # files handed to my-ocr
+  _skipped=""         # marked no-ocr: filed as they are
+
+  while IFS= read -r S_INP; do
+    [ -z "$S_INP" ] && continue
+    pe ""
+    pe " >>> '$S_INP'"
+    [ -e "$S_INP" ] || { err 026 "File '$S_INP' not found." "-"; continue; }
+
+    INP="${S_INP##*/}"
+
+    # 1. SETTLE -- the delivery may still be arriving over SMB or FTP
+    if ! settle_file "$S_INP"; then
+      FAILED_CNT=$(( FAILED_CNT + 1 ))
+      T_PATH="$T_PATH_FAILED"; stage_file
+      T_PATH="$OCR_QUEUE_PATH"
+      err 028 "'$S_INP' never settled within ${SETTLE_TIMEOUT}s -- filed under FAILED." "-"
+      continue
+    fi
+    pe "  >  settled ($(file_size "$S_INP") bytes) [0]"
+    settle_backup "$S_INP"
+
+    # 2. A light type check only. my-ocr does the deep validation -- it skips
+    #    already-OCRed and encrypted files itself, and knows more about them
+    #    than my-scan should.
+    INP_FILE_TYPE="$(file --brief "$S_INP")"
+    if printf '%s\n' "$INP_FILE_TYPE" | grep -qv "^$ACCEPT_FILE_TYPE_REGEX"; then
+      WRONG_FILETYPE_CNT=$(( WRONG_FILETYPE_CNT + 1 ))
+      FAILED_CNT=$(( FAILED_CNT + 1 ))
+      T_PATH="$T_PATH_FAILED"; stage_file
+      T_PATH="$OCR_QUEUE_PATH"
+      err 030 "Unexpected file type '$INP_FILE_TYPE' -- filed under FAILED." "-"
+      continue
+    fi
+    pe "  >  type '$INP_FILE_TYPE' PASSED"
+
+    # 3. A marked file is filed as it is: we simply do not call my-ocr for it.
+    _no_ocr=""
+    for _pat in $NO_OCR_PATTERNS; do
+      # shellcheck disable=SC2254  # a config-supplied glob, deliberately
+      case "$INP" in $_pat) _no_ocr=1;; esac
+    done
+    if [ -n "$_no_ocr" ]; then
+      IGNORED_CNT=$(( IGNORED_CNT + 1 ))
+      T_PATH="$T_PATH_DONE"; stage_file
+      T_PATH="$OCR_QUEUE_PATH"
+      pe "  >  matches NO_OCR_PATTERNS -- filed without OCR."
+      continue
+    fi
+
+    # 4. Name it and move it into the OCR queue.
+    if stage_file; then
+      _staged="${_staged}${_staged:+$NL}$T_INP"
+    else
+      FAILED_CNT=$(( FAILED_CNT + 1 ))
+    fi
+  done <<_EOPI_
+$INP_FILES
+_EOPI_
+
+  stage_lock_release   # everything is claimed; OCR needs no staging lock
+
+  # ---- hand the batch to my-ocr, in page-bounded chunks --------------------
+  if [ -n "$_staged" ]; then
+    _n="$(printf '%s\n' "$_staged" | wc -l | tr -d ' ')"
+    pe ""
+    pe " >>> Handing $_n file(s) to $MY_OCR"
+    pe "     It blocks until it is our turn -- one FineReader run exists at a"
+    pe "     time, and my-ocr is what guarantees that."
+    pe "     Anything it cannot OCR goes to '$T_PATH_FAILED' (--move-failed-to)."
+    ocr_in_chunks "$_staged"
+  fi
+
+  pe ""
+  _pfx="$LOGPFX|>RESULT<| "
+  printf "%sGot %4d file(s):\n"                 "$_pfx" "$INP_FILES_CNT"
+  printf "%s  > %4d OCRed and filed.\n"         "$_pfx" "$FILES_OCRED_CNT"
+  printf "%s  > %4d filed without OCR.\n"       "$_pfx" "$IGNORED_CNT"
+  printf "%s  > %4d failed (of which %d wrong file type).\n" \
+                                                "$_pfx" "$FAILED_CNT" "$WRONG_FILETYPE_CNT"
+
+  pe ""
+  pe "$(date +"%Y-%m-%d_%H%M.%S") DONE."
+  [ -n "$LOG" ] && exec 1<&3 && exec 3<&- && REDIRECT_TO_LOG=1
+  return 0
+}
+
+##############################################################################
+#### OCR APPLICATION CONTROL
+
+
+
+
+##############################################################################
+#### INPUT COLLECTION (argv, else stdin)
+
+# Only 'process' feeds this now, and Automator always pipes: the argv branch
+# left with the 'settle' subcommand.
+collect_inputs() {
+  [ -t 0 ] && return 0
+  cat
+}
+
+
+##############################################################################
+#### SCAN -- pull-scan from the device (was: the whole of the old my-scan)
+
+scan_backend() {
+  if [ -n "$c_scanimage" ] && [ -x "$c_scanimage" ]; then _p "scanimage"; return 0; fi
+  command -v scanimage  >/dev/null 2>&1 && { _p "scanimage";  return 0; }
+  command -v epsonscan2 >/dev/null 2>&1 && { _p "epsonscan2"; return 0; }
+  case "$SCAN_DEVICE" in
+    http://*|https://*|esclnet:*) _p "escl"; return 0 ;;
+  esac
+  _p ""
+  return 1
+}
+
+scan_device_host() { # the host/ip part of SCAN_DEVICE, or "" if it has none
+  case "$SCAN_DEVICE" in
+    *:net:*)       printf '%s\n' "${SCAN_DEVICE##*:net:}" ;;
+    http://*|https://*)
+                   _h="${SCAN_DEVICE#*://}"; _h="${_h%%/*}"; printf '%s\n' "${_h%%:*}" ;;
+    *)             _p "" ;;
+  esac
+}
+
+do_devices() {
+  msg "Looking for scanners"
+  _found=0
+
+  _be="$(scan_backend)"
+  vdet "backend that would be used for a scan: ${_be:-<none installed>}"
+
+  if command -v scanimage >/dev/null 2>&1; then
+    vrb "scanimage -L"
+    vdet "asks every installed SANE backend what it can see"
+    _out="$(scanimage -L 2>&1)"
+    indent "$_out" "    > "
+    printf '%s\n' "$_out" | grep -q "^device" && _found=1
+  else
+    det "scanimage is not installed -- skipping the SANE query"
+  fi
+
+  if command -v ippfind >/dev/null 2>&1; then
+    vrb "ippfind -T 10 _uscan._tcp -p"
+    vdet "browses mDNS for driverless (eSCL/AirScan) scanners on this LAN"
+    _out="$(ippfind -T 10 _uscan._tcp -p 2>&1)"
+    if [ -n "$_out" ]; then indent "$_out" "    > "; _found=1
+    else det "no _uscan._tcp responder on this LAN"; fi
+  fi
+
+  _host="$(scan_device_host)"
+  if [ -n "$_host" ]; then
+    if ping -c1 -t2 "$_host" >/dev/null 2>&1; then
+      det "configured device '$SCAN_DEVICE_NAME' at $_host is reachable [0]"
+      _found=1
+    else
+      det "configured device '$SCAN_DEVICE_NAME' at $_host is NOT reachable [$?]"
+    fi
+  else
+    det "SCAN_DEVICE '$SCAN_DEVICE' carries no host -- nothing to ping"
+  fi
+
+  [ "$_found" = "1" ] || msg "Found no scanner. Is it powered on and on this subnet?"
+  return 0
+}
+
+scan_once() { # runs one scan; sets SCAN_CMDSTR; returns the backend's rc
+  # shellcheck disable=SC2086  # a deliberate list of scanner options
+  set -- scanimage --device-name "$SCAN_DEVICE" $SCAN_OPTS --source "$SCAN_SOURCE"
+  [ -n "$SCAN_BATCH_FILENAME" ] && set -- "$@" "--batch=$SCAN_BATCH_FILENAME"
+  SCAN_CMDSTR="$*"
+  [ "$VRB" = "1" ] && _p " >>> $SCAN_CMDSTR"
+  "$@"
+  _rc=$?
+  ddbg "scan_once(): rc=$_rc"
+  return $_rc
+}
+
+do_scan() {
+  # Only the scanimage backend is implemented; scan_backend() recognises escl
+  # and epsonscan2 but scan_once() drives scanimage. Say which of those two
+  # cases this is rather than blaming the device string for either.
+  _be="$(scan_backend)"
+  case "$_be" in
+    scanimage) : ;;
+    "")        err 048 "No scan backend at all: 'scanimage' is not installed and SCAN_DEVICE '$SCAN_DEVICE' names no recognised backend. Install one with 'brew install sane-backends', then '$US devices'." ;;
+    *)         err 048 "SCAN_DEVICE '$SCAN_DEVICE' selects the '$_be' backend, which is not implemented yet -- only 'scanimage' is. Install it with 'brew install sane-backends'." ;;
+  esac
+
+  if [ -n "$1" ]; then fn="$1"; shift; else fn="$SCAN_DEFAULT_FNAME"; fi
+  full_fn="$SCAN_OUT_PATH/$fn"
+
+  NOW_FN="$(date +'%Y-%m-%d_%H%M.%S')"
+  TEMPFILE_PREFIX=".scan-out_${NOW_FN}_"
+  SCAN_BATCH_FILENAME="${TEMPFILE_PREFIX}%d.$SCAN_FORMAT"
+  SCAN_OPTS="$SCAN_DEFAULT_OPTS --mode $SCAN_MODE --resolution ${SCAN_DPI}dpi $*"
+
+  cd "$SCAN_OUT_PATH" || err 049 "Cannot cd to SCAN_OUT_PATH '$SCAN_OUT_PATH'."
+
+  msg "Scanning '$SCAN_DEVICE_NAME' to '$fn' in '$SCAN_OUT_PATH'"
+  det "options: $SCAN_OPTS"
+
+  if [ -n "$DUPLEX" ]; then
+    SCAN_SOURCE="Duplex"
+    det "expecting a DUPLEX document in the feeder"
+  else
+    SCAN_SOURCE="ADF"
+    det "trying the document feeder first"
+  fi
+
+  if [ -n "$WAIT_FOR_ADF" ]; then
+    rc=7
+    while [ "$rc" -eq 7 ]; do
+      det "waiting for a document in the feeder..."
+      scan_once; rc=$?
+      [ "$rc" -eq 7 ] && sleep 2
+    done
+  else
+    scan_once; rc=$?
+    if [ "$rc" -eq 7 ]; then
+      SCAN_SOURCE="Flatbed"
+      det "feeder is empty [7] -- scanning from the flatbed instead"
+      scan_once; rc=$?
+    fi
+  fi
+
+  [ "$rc" -ne 4 ] && [ "$rc" -ne 0 ] \
+    && err 050 "Scan failed [$rc]: $SCAN_CMDSTR  (pwd '$(pwd)')"
+
+  msg2 "Assembling the pages into '$fn'"
+  run "$c_convert" "$SCAN_OUT_PATH/$TEMPFILE_PREFIX"* "$full_fn" \
+    || err 051 "FAILED to assemble '$SCAN_OUT_PATH/$TEMPFILE_PREFIX'* into '$full_fn'."
+
+  scan_cleanup
+
+  if [ -n "$SCAN_VIEWER_CMD" ]; then
+    # deliberately word-split: it is a command WITH arguments ("open -a Preview")
+    # shellcheck disable=SC2086
+    run $SCAN_VIEWER_CMD "$full_fn" \
+      || err 052 "FAILED [$?] to open '$full_fn' with '$SCAN_VIEWER_CMD'." "-"
+  else
+    vdet "SCAN_VIEWER_CMD is empty -- not opening '$full_fn'"
+  fi
+
+  msg "done :)  '$full_fn' ($(file_size "$full_fn") bytes) [0]"
+  return 0
+}
+
+scan_cleanup() {
+  [ -n "$CLEANUP_DONE" ] && return 0
+  CLEANUP_DONE=1
+  [ -z "$TEMPFILE_PREFIX" ] && return 0
+  if [ "$DBG" = "1" ]; then
+    dbg "keeping the temp files (debug mode):"
+    find "$SCAN_OUT_PATH" -maxdepth 1 -name "$TEMPFILE_PREFIX*" 2>/dev/null | sed -e "s|^|   ~ |" 1>&2
+    return 0
+  fi
+  _tmp="$(ls "$SCAN_OUT_PATH/$TEMPFILE_PREFIX"* 2>/dev/null)"
+  [ -z "$_tmp" ] && return 0
+  while IFS= read -r _f; do
+    [ -z "$_f" ] && continue
+    rm -f "$_f" || det "FAILED to remove '$_f'"
+  done <<_EOCL_
+$_tmp
+_EOCL_
+  return 0
+}
+
+
+##############################################################################
+#### STATUS
+
+count_files() { # $1 = dir -> number of plain files in it, "-" if missing
+  [ -d "$1" ] || { _p "-"; return 1; }
+  find "$1" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+running_pids() {
+  pgrep -f "$US " 2>/dev/null | grep -v "^$$\$" | xargs echo
+}
+
+
+folder_action_state() {
+  _plist="$HOME/Library/Preferences/com.apple.FolderActionsDispatcher.plist"
+  [ -f "$_plist" ] || { _p "no folder-action preferences file"; return 1; }
+  _enabled="$(/usr/libexec/PlistBuddy -c "Print :folderActionsEnabled" "$_plist" 2>/dev/null)"
+  [ -z "$_enabled" ] && _enabled="unknown"
+  # the bindings are NSKeyedArchiver blobs; the folder and workflow names are
+  # still readable as plain strings inside them
+  _names="$(strings "$_plist" 2>/dev/null \
+             | grep -E "^[A-Za-z0-9][A-Za-z0-9._+-]*\.workflow\$" | sort -u | xargs echo)"
+  _p "enabled=$_enabled workflows=${_names:-<none>}"
+}
+
+# One line per thing that exists right now: "<state><TAB><path>". cancel_list
+# is the single source of truth for what is IN FLIGHT; the two destination
+# folders are added here because landing there is the whole point of watching.
+watch_snapshot() {
+  cancel_list
+  [ -d "$T_PATH_DONE" ] && find "$T_PATH_DONE" -mindepth 1 -maxdepth 1 -type f 2>/dev/null \
+    | while IFS= read -r _f; do [ -n "$_f" ] && printf 'filed\t%s\n' "$_f"; done
+  [ -d "$T_PATH_FAILED" ] && find "$T_PATH_FAILED" -mindepth 1 -maxdepth 1 -type f 2>/dev/null \
+    | while IFS= read -r _f; do [ -n "$_f" ] && printf 'FAILED\t%s\n' "$_f"; done
+  return 0
+}
+
+# A live view that RECORDS changes instead of repainting. A repaint loop
+# destroys the scrollback, which is exactly the history you are watching for,
+# and a file that moves between two polls would leave no trace at all.
+do_watch_status() {
+  # my-ocr is only consulted when the OCR queue is non-empty -- that is the
+  # only time the answer can differ, and it is a process spawn per poll.
+  OCR_STATE="queued for OCR"
+  _ws_prev="$(mktemp /tmp/my-scan.w1.XXXXXX)" || err 071 "mktemp failed."
+  _ws_cur="$(mktemp /tmp/my-scan.w2.XXXXXX)"  || err 071 "mktemp failed."
+  # shellcheck disable=SC2064  # expand the paths now, not at trap time
+  trap "rm -f '$_ws_prev' '$_ws_cur'; echo; exit 0" INT TERM HUP
+
+  if ! isNum "$WATCH_INTERVAL"; then
+    WATCH_INTERVAL=1
+    vdet "WATCH_INTERVAL is unset in $CONFIG_FILE -- using ${WATCH_INTERVAL}s"
+  fi
+
+  do_status ""
+  echo
+  msg "watching every ${WATCH_INTERVAL}s -- Ctrl-C to stop"
+  det "'+' appeared in that state, '-' left it; a move shows as both"
+
+  watch_ocr_state
+  watch_snapshot | sort > "$_ws_prev"
+  # NOT 'grep -c . || echo 0': grep -c PRINTS the count and EXITS 1 when the
+  # count is zero, so the fallback appends a second "0" and the result ("0\n0")
+  # is not a number any more.
+  # "have we seen activity" counts only what is IN FLIGHT. Documents already
+  # filed are history, not activity -- counting them would make a watch started
+  # against a pipeline with a full destination folder exit immediately.
+  _seen="$(cancel_list 2>/dev/null | awk 'NF{n++} END{print n+0}')"
+  [ "$_seen" -gt 0 ] && _ws_any=1 || _ws_any=""
+  _ws_idle=0
+
+  while :; do
+    sleep "$WATCH_INTERVAL"
+    watch_ocr_state
+    watch_snapshot | sort > "$_ws_cur"
+    if ! cmp -s "$_ws_prev" "$_ws_cur"; then
+      _ts="$(date +%H:%M:%S)"
+      comm -13 "$_ws_prev" "$_ws_cur" | while IFS="$TAB" read -r _st _f; do
+        [ -n "$_f" ] && printf '  %s  + %-16s %s\n' "$_ts" "$_st" "${_f##*/}"
+      done
+      comm -23 "$_ws_prev" "$_ws_cur" | while IFS="$TAB" read -r _st _f; do
+        [ -n "$_f" ] && printf '  %s  - %-16s %s\n' "$_ts" "$_st" "${_f##*/}"
+      done
+      cp "$_ws_cur" "$_ws_prev"
+      _ws_any=1
+    fi
+
+    # drained = nothing in flight and my-ocr idle. Only ever exit if this run
+    # actually saw something; started against an empty pipeline it waits.
+    _inflight="$(cancel_list 2>/dev/null | awk 'NF{n++} END{print n+0}')"
+    if [ -n "$_ws_any" ] && [ "$_inflight" -eq 0 ] && [ "$OCR_STATE" != "OCRing" ]; then
+      _ws_idle=$(( _ws_idle + 1 ))
+      if [ "$_ws_idle" -ge 2 ]; then
+        echo
+        msg "pipeline drained -- nothing in flight, my-ocr idle [0]"
+        rm -f "$_ws_prev" "$_ws_cur"
+        return 0
+      fi
+    else
+      _ws_idle=0
+    fi
+  done
+}
+
+# "queued for OCR" only becomes "OCRing" when my-ocr says it is busy. Asking it
+# costs a process, so ask only when there is something it could be working on.
+watch_ocr_state() {
+  OCR_STATE="queued for OCR"
+  [ -d "$OCR_QUEUE_PATH" ] || return 0
+  case "$(find "$OCR_QUEUE_PATH" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | head -n 1)" in
+    "") return 0 ;;
+  esac
+  if [ -x "$MY_OCR" ] && "$MY_OCR" --status 2>/dev/null | grep -q "^OCR       BUSY"; then
+    OCR_STATE="OCRing"
+  fi
+  return 0
+}
+
+do_status() {
+  _pfx="$1"
+
+  _p "${_pfx}CONFIG    $CONFIG_FILE (via $CONFIG_SOURCE)"
+  _p "${_pfx}VERSION   $(do_version)"
+
+  # drop folders, label and path in parallel lists
+  _i=1
+  for _dp in $DROP_PATHS; do
+    _lbl="$(printf '%s\n' "$DROP_LABELS" | awk -v n="$_i" '{print $n}')"
+    [ -z "$_lbl" ] && _lbl="drop$_i"
+    _n="$(count_files "$_dp")"
+    if [ "$_n" = "-" ]; then _p "${_pfx}DROP      $_lbl  $_dp  MISSING"
+    else                     _p "${_pfx}DROP      $_lbl  $_dp  $_n waiting"; fi
+    # -V answers the question you actually came with when a scan has not been
+    # picked up: which of the three settle checks is it still failing?
+    if [ "$VRB" = "1" ] && [ "$_n" != "-" ] && [ "$_n" != "0" ]; then
+      settle_report "$_dp" "${_pfx}          "
+    fi
+    _i=$(( _i + 1 ))
+  done
+
+  # Ask my-ocr ONCE, before the queues are printed: whether it is busy decides
+  # whether a queued file is in flight or stranded.
+  OCR_STATUS=""; OCR_BUSY=0
+  if [ -x "$MY_OCR" ]; then
+    OCR_STATUS="$("$MY_OCR" --status 2>/dev/null)"
+    case "$OCR_STATUS" in *"OCR       BUSY"*) OCR_BUSY=1 ;; esac
+  fi
+
+  # Nothing ever picks a file out of the OCR queue on its own: 'process' stages
+  # from a drop folder and hands the batch straight to my-ocr. So a file left
+  # here while my-ocr is idle is STRANDED, and saying so is the difference
+  # between "wait" and "do something".
+  _q2="$(count_files "$OCR_QUEUE_PATH")"
+  _q2d="$(count_docs_pages "$OCR_QUEUE_PATH")"
+  if [ "$_q2" = "0" ]; then
+    _q2n="empty"
+  elif [ "$OCR_BUSY" = "1" ]; then
+    _q2n="$_q2d  being OCRed now -- they will clear on their own"
+  else
+    _q2n="$_q2d  STRANDED: nothing will pick these up ('$US process --retry')"
+  fi
+  _p "${_pfx}QUEUE     2ocr  $OCR_QUEUE_PATH  $_q2n"
+  _qf="$(count_files "$T_PATH_FAILED")"
+  if [ "$_qf" = "0" ]; then
+    _p "${_pfx}QUEUE     fail  $T_PATH_FAILED  empty"
+  else
+    _p "${_pfx}QUEUE     fail  $T_PATH_FAILED  $(count_docs_pages "$T_PATH_FAILED")  my-ocr could not OCR these ('$US process --retry failed')"
+  fi
+  [ "$VRB" = "1" ] && _p "${_pfx}QUEUE     done  $T_PATH_DONE  $(count_files "$T_PATH_DONE") files"
+
+  _p "${_pfx}FOLDERACTION $(folder_action_state)"
+  [ "$VRB" = "1" ] && _p "${_pfx}          workflow: $WORKFLOW_DIR/$WORKFLOW_NAME$( [ -d "$WORKFLOW_DIR/$WORKFLOW_NAME" ] && echo " (present)" || echo " (MISSING)" )"
+
+  # my-ocr knows what my-scan can only infer: whether the mutex is held and by
+  # whom, and what is still queued. One line always -- "is the OCR busy" is the
+  # actionable fact and the reason to run status at all -- the rest under -V.
+  if [ -x "$MY_OCR" ]; then
+    _os="$OCR_STATUS"
+    if [ -n "$_os" ]; then
+      _p "${_pfx}MY-OCR    $(printf '%s' "$_os" | sed -n 's/^OCR  *//p' | head -1)"
+      if [ "$VRB" = "1" ]; then
+        "$MY_OCR" -V --status 2>/dev/null | sed -e "s/^/${_pfx}          /"
+      fi
+    else
+      _p "${_pfx}MY-OCR    '$MY_OCR' gave no status"
+    fi
+  else
+    _p "${_pfx}MY-OCR    NOT FOUND at '$MY_OCR' -- my-scan cannot OCR anything"
+  fi
+
+  # OCR app
+  if pgrep "$OCRAPP_NAME" >/dev/null 2>&1; then
+    _p "${_pfx}OCRAPP    $OCRAPP_NAME running (pid(s) $(pgrep "$OCRAPP_NAME" | xargs echo))"
+  else
+    if [ -d "$OCRAPP_PATH" ]; then
+      _p "${_pfx}OCRAPP    $OCRAPP_NAME not running ($OCRAPP_PATH)"
+    else
+      _p "${_pfx}OCRAPP    $OCRAPP_NAME NOT INSTALLED at '$OCRAPP_PATH' -- OCR cannot run here"
+    fi
+  fi
+
+  _rp="$(running_pids)"
+  # A bare list of pids explains nothing. Say what each one is doing.
+  if [ -z "$_rp" ]; then
+    _p "${_pfx}RUNNING   <none>"
+  else
+    _rpn=0
+    for _rpp in $_rp; do
+      _rpn=$(( _rpn + 1 ))
+      _rpw="$(ps -o command= -p "$_rpp" 2>/dev/null | sed -e "s|.*$US ||" -e 's/  */ /g' | cut -c1-46)"
+      case "$_rpw" in "") _rpw="(gone)";; esac
+      _p "${_pfx}RUNNING   $_rpp  $US $_rpw"
+    done
+    [ "$_rpn" -gt 1 ] && \
+      _p "${_pfx}          (one 'process' run is my-scan itself plus the my-ocr it is waiting on)"
+  fi
+
+  # LAST, deliberately: this is the only line that costs time -- reaching a
+  # scanner that is usually off takes the full ping timeout. Everything about
+  # the pipeline is already on screen before we go and wait for it.
+  _host="$(scan_device_host)"
+  if [ -n "$_host" ]; then
+    if ping -c1 -t2 "$_host" >/dev/null 2>&1; then
+      _reach="reachable [0]"
+    else
+      _rc=$?
+      # a scanner that is meant to be off should not read as a fault
+      if [ -n "$SCAN_DEVICE_USUALLY_OFF" ]; then
+        _reach="not answering (normally off) [$_rc]"
+      else
+        _reach="UNREACHABLE [$_rc]"
+      fi
+    fi
+  else
+    _reach="no address in SCAN_DEVICE -- it needs one; a Bonjour name is not enough"
+  fi
+  _p "${_pfx}SCANNER   $SCAN_DEVICE_NAME ($SCAN_DEVICE)  $_reach"
+  [ "$VRB" = "1" ] && _p "${_pfx}          backend: $(scan_backend)"
+
+  return 0
+}
+
+# ---------------------------------------------------------------- cancel
+# DOCUMENTS. A person reaching for "cancel" is thinking about a scan, not
+# about a lockfile -- the plumbing is a consequence and is only shown with -V.
+# Nothing is ever deleted: the worst that happens to a document is a move to
+# T_PATH_FAILED, where status will show it.
+cancel_list() { # writes "state<TAB>path" lines
+  _i=1
+  for _dp in $DROP_PATHS; do
+    [ -d "$_dp" ] || continue
+    find "$_dp" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | while IFS= read -r _f; do
+      [ -n "$_f" ] && printf 'arriving\t%s\n' "$_f"
+    done
+  done
+  [ -d "$OCR_QUEUE_PATH" ] && find "$OCR_QUEUE_PATH" -mindepth 1 -maxdepth 1 -type f 2>/dev/null \
+    | while IFS= read -r _f; do
+        [ -n "$_f" ] && printf '%s\t%s\n' "$OCR_STATE" "$_f"
+      done
+  return 0
+}
+
+do_cancel() {
+  # is my-ocr working right now? that is what turns "queued" into "OCRing"
+  OCR_STATE="queued for OCR"
+  if [ -x "$MY_OCR" ] && "$MY_OCR" --status 2>/dev/null | grep -q "^OCR       BUSY"; then
+    OCR_STATE="OCRing"
+  fi
+
+  _tmp="$(mktemp /tmp/my-scan.cancel.XXXXXX)" || err 071 "mktemp failed."
+  cancel_list > "$_tmp"
+  _n="$(awk 'NF{n++} END{print n+0}' "$_tmp" 2>/dev/null)"
+
+  if [ "$_n" -eq 0 ]; then
+    msg "Nothing is in flight -- nothing to cancel."
+    det "(documents already filed in '$T_PATH_DONE' are finished work, not pipeline state)"
+    rm -f "$_tmp"; return 0
+  fi
+
+  # always LIST first: the destructive form is never what you get by accident
+  msg "$_n document(s) in flight"
+  printf '  %-3s %-46s %-16s\n' "ID" "DOCUMENT" "STATE"
+  _i=0
+  while IFS="$TAB" read -r _st _f; do
+    [ -z "$_f" ] && continue
+    _i=$(( _i + 1 ))
+    printf '  %-3s %-46s %-16s\n' "$_i" "$(printf '%.46s' "${_f##*/}")" "$_st"
+    [ "$VRB" = "1" ] && _p "      $_f"
+  done < "$_tmp"
+
+  if [ -z "$CANCEL_ALL" ] && [ $# -eq 0 ]; then
+    echo
+    det "nothing cancelled -- '$US cancel <ID>...' or '$US cancel --all'"
+    rm -f "$_tmp"; return 0
+  fi
+
+  # --all can stop work you have not looked at, so it asks -- and with no
+  # terminal to ask, it refuses rather than guessing.
+  if [ -n "$CANCEL_ALL" ] && [ -z "$ASSUME_YES" ]; then
+    if [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then
+      printf '  Cancel all %s document(s)? [y/N] ' "$_n"
+      read -r _ans </dev/tty 2>/dev/null || _ans=""
+      case "$_ans" in y|Y|yes|YES) ;; *) det "aborted."; rm -f "$_tmp"; return 0;; esac
+    else
+      rm -f "$_tmp"
+      err 072 "'--all' needs confirmation and there is no terminal to ask. Add --yes."
+    fi
+  fi
+
+  mkdir -p "$T_PATH_FAILED" 2>/dev/null
+  _done=0
+  _i=0
+  while IFS="$TAB" read -r _st _f; do
+    [ -z "$_f" ] && continue
+    _i=$(( _i + 1 ))
+    if [ -z "$CANCEL_ALL" ]; then
+      _want=""
+      for _id in "$@"; do [ "$_id" = "$_i" ] && _want=1; done
+      [ -z "$_want" ] && continue
+    fi
+    [ -e "$_f" ] || continue
+    _t="$T_PATH_FAILED/${_f##*/}"
+    [ -e "$_t" ] && _t="$T_PATH_FAILED/$(date +%Y-%m-%d_%H%M.%S)___${_f##*/}"
+    if mv "$_f" "$_t"; then
+      _done=$(( _done + 1 ))
+      msg2 "cancelled: '${_f##*/}' -> '$T_PATH_FAILED/'"
+      [ "$_st" = "OCRing" ] && det "its OCR is still running -- '$US reset' stops the machinery"
+    else
+      err 073 "FAILED [$?] to move '$_f' to '$T_PATH_FAILED/'" "-"
+    fi
+  done < "$_tmp"
+  rm -f "$_tmp"
+  msg "cancelled $_done document(s) [0]"
+  det "nothing was deleted -- they are in '$T_PATH_FAILED'"
+  return 0
+}
+
+# ----------------------------------------------------------------- reset
+# MACHINERY. Stale state that stops the pipeline running. It NEVER touches a
+# document -- that promise is what makes it safe to run when you have no idea
+# what is wrong, and it is the last thing the output says.
+do_reset() {
+  _found=0
+
+  _rp="$(running_pids)"
+  if [ -n "$_rp" ]; then
+    _found=$(( _found + 1 ))
+    msg2 "other $US process(es): $_rp"
+    if [ -n "$RESET_ALL" ] && [ -z "$DRY_RUN" ]; then
+      # shellcheck disable=SC2086  # a deliberate list of pids
+      kill $_rp 2>/dev/null && det "killed"
+    else
+      det "would kill them"
+    fi
+  fi
+
+  # my-ocr owns its own machinery, so it is the one that knows how to clean it.
+  # Hand the job over rather than reaching into its state from here.
+  if [ -x "$MY_OCR" ]; then
+    _os="$("$MY_OCR" --status 2>/dev/null)"
+    case "$_os" in
+      *"BUSY"*)
+        _found=$(( _found + 1 ))
+        msg2 "an OCR is running:"
+        printf '%s\n' "$_os" | grep "BUSY" | sed -e 's/^/    > /'
+        det "leave it unless it is wedged -- my-ocr alerts by itself when it stalls"
+        det "(my-ocr reset refuses while a run is live, so it is not called here)" ;;
+      *)
+        msg2 "my-ocr machinery"
+        if [ -n "$RESET_ALL" ] && [ -z "$DRY_RUN" ]; then
+          "$MY_OCR" reset go 2>&1 | sed -e 's/^/    | /'
+        else
+          "$MY_OCR" reset    2>&1 | sed -e 's/^/    | /'
+        fi
+        det "^ my-ocr's own reset: stale mutex, leftovers from runs that are gone,"
+        det "  and any document stranded mid-flight moved where it can be retried" ;;
+    esac
+  fi
+
+  if [ "$_found" -eq 0 ]; then
+    msg "Machinery is clean -- nothing to reset."
+  elif [ -z "$RESET_ALL" ]; then
+    echo
+    det "nothing changed -- '$US reset --all' to act on the above"
+  fi
+  echo
+  det "no documents are touched by reset -- use '$US cancel' for those"
+  return 0
+}
+
+
+##############################################################################
+#### WATCH -- the OCR deblock watchdog (was: ___wait-for-ocr)
+##
+## Automator only advances to the OCR step once part-1's shell action has
+## exited, so part-1 cannot wait for the OCR itself. This runs in the
+## background instead: if the OCR never finishes, it removes the stale lock
+## and fails the file out, so the NEXT scan is not blocked for the full
+## LOCKFILE_TIMEOUT. It does not duplicate part-2 -- it calls it.
+
+
+
+
+##############################################################################
+#### SETUP -- wire the Folder Action + Automator workflow for the GUI user
+
+automator_app() {
+  for _c in /System/Applications/Automator.app /Applications/Automator.app; do
+    [ -d "$_c" ] && { _p "$_c"; return 0; }
+  done
+  _p ""
+  return 1
+}
+
+setup_preflight() {
+  _fail=0
+  msg2 "Preflight -- everything the Folder Action will need at scan time"
+
+  _a="$(automator_app)"
+  if [ -n "$_a" ]; then det "Automator      OK   $_a"
+  else                  det "Automator      MISSING -- reinstall it from the macOS installer"; _fail=1; fi
+
+  if [ -d "$OCRAPP_PATH" ]; then det "$OCRAPP_NAME     OK   $OCRAPP_PATH"
+  else det "$OCRAPP_NAME     MISSING at '$OCRAPP_PATH' -- OCR cannot run"; _fail=1; fi
+
+  _act="$OCRAPP_PATH/Contents/Library/Automator/ExportToPdf.action"
+  if [ -d "$_act" ]; then det "OCR action     OK   $_act"
+  else det "OCR action     MISSING at '$_act' -- the workflow's OCR step will not load"; _fail=1; fi
+
+  for _c in "$c_trash" "$c_convert" "$c_pdfinfo" "$c_lsof"; do
+    if [ -x "$_c" ]; then det "$(printf '%-14s' "${_c##*/}") OK   $_c"
+    else det "$(printf '%-14s' "${_c##*/}") MISSING at '$_c'"; _fail=1; fi
+  done
+
+  if [ -x "$WORKFLOW_MY_SCAN" ]; then det "my-scan        OK   $WORKFLOW_MY_SCAN"
+  else det "my-scan        NOT EXECUTABLE at '$WORKFLOW_MY_SCAN' -- the workflow calls that path"; _fail=1; fi
+
+  if [ "$_fail" = "0" ]; then det "preflight PASSED [0]"; else det "preflight FAILED [$_fail]"; fi
+  return $_fail
+}
+
+setup_dirs() {
+  msg2 "Directories named by the config"
+  _fail=0
+  # DROP_PATHS is a space-separated list; one directory per line from here on
+  _dirs=""
+  for _dp in $DROP_PATHS; do _dirs="$_dirs$_dp
+"; done
+  _dirs="$_dirs$OCR_QUEUE_PATH
+$PART2_S_PATH
+$PART2_T_PATH
+$T_PATH_DONE
+$T_PATH_FAILED
+$LOCKFILE_PATH
+$WORKFLOW_DIR"
+  [ -n "$LOG" ] && _dirs="$_dirs
+${LOG%/*}"
+  [ -n "$SETTLE_BACKUP_PATH" ] && _dirs="$_dirs
+$SETTLE_BACKUP_PATH"
+
+  _seen=""
+  while IFS= read -r _d; do
+    [ -z "$_d" ] && continue
+    case "$_seen" in *"|$_d|"*) continue ;; esac
+    _seen="$_seen|$_d|"
+
+    if [ -d "$_d" ]; then
+      if [ -w "$_d" ]; then det "OK       $_d"
+      else det "NOT WRITABLE by $(id -un): $_d  (owner $(/usr/bin/stat -f '%Su:%Sg mode %Lp' "$_d"))"; _fail=1; fi
+    elif [ -n "$DRY_RUN" ]; then
+      det "WOULD CREATE  $_d"
+    else
+      if mkdir -p "$_d" 2>/dev/null; then det "CREATED  $_d"
+      else det "CANNOT CREATE $_d -- its parent is not writable by $(id -un)"; _fail=1; fi
+    fi
+  done <<_EOSD_
+$_dirs
+_EOSD_
+  return $_fail
+}
+
+# The Automator document. Three steps, exactly as the hand-built workflow on
+# the live machine: shell -> OCR -> shell. The shell steps call THIS tool, so
+# the settle/validate logic lives in the repo instead of inside the workflow.
+setup_write_workflow() {
+  _wf="$WORKFLOW_DIR/$WORKFLOW_NAME"
+  msg2 "Automator workflow '$_wf'"
+
+  # A config written before WORKFLOW_SHELL existed leaves it empty, which would
+  # write a workflow with no shell -- and Automator runs those silently, doing
+  # nothing at all. Fall back, and refuse a shell Automator does not offer.
+  [ -n "$WORKFLOW_SHELL" ] || WORKFLOW_SHELL="/bin/zsh"
+  case "$WORKFLOW_SHELL" in
+    /bin/bash|/bin/csh|/bin/ksh|/bin/sh|/bin/tcsh|/bin/zsh) ;;
+    /usr/bin/perl|/usr/bin/ruby|/usr/local/bin/python|/usr/local/bin/python3) ;;
+    *) err 063 "WORKFLOW_SHELL '$WORKFLOW_SHELL' is not one Automator accepts. \
+Its Run Shell Script step silently does nothing with any other shell -- no error, \
+nothing in any log. Use one of: /bin/zsh /bin/sh /bin/bash /bin/ksh /bin/csh /bin/tcsh." "-"
+       return 1 ;;
+  esac
+
+  if [ -d "$_wf" ]; then
+    _bak="$_wf.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+    if [ -n "$DRY_RUN" ]; then det "WOULD BACK UP the existing workflow to '$_bak'"
+    else run cp -R "$_wf" "$_bak" || { err 059 "FAILED to back up '$_wf'" "-"; return 1; }
+         det "backed the existing workflow up to '$_bak'"; fi
+  fi
+
+  # keep the backup pile bounded; one accumulates per 'setup go' otherwise
+  if [ -z "$DRY_RUN" ]; then
+    _keep="$WORKFLOW_BACKUPS_KEEP"; isInt "$_keep" || _keep=3
+    find "$WORKFLOW_DIR" -maxdepth 1 -type d -name "$WORKFLOW_NAME.bak-*" 2>/dev/null \
+      | sort -r | tail -n +$(( _keep + 1 )) \
+      | while IFS= read -r _ob; do
+          [ -n "$_ob" ] && rm -rf "$_ob" && det "pruned old backup '${_ob##*/}'"
+        done
+  fi
+
+  if [ -n "$DRY_RUN" ]; then
+    det "WOULD WRITE a ONE-step workflow: $WORKFLOW_MY_SCAN process"
+    det "  my-ocr does the OCR and has its own Folder Action, so Automator"
+    det "  no longer has to drive $OCRAPP_NAME across two shell steps."
+    return 0
+  fi
+
+  mkdir -p "$_wf/Contents" || { err 060 "FAILED to create '$_wf/Contents'" "-"; return 1; }
+
+  cat >"$_wf/Contents/Info.plist" <<_EOIP_
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AMFolderAction</key>
+	<string>AMAddingFolderItems</string>
+</dict>
+</plist>
+_EOIP_
+
+  _doc="$_wf/Contents/document.wflow"
+  _gerr="$(mktemp /tmp/my-scan.wflow.XXXXXX)" || return 1
+  # The workflow records WHICH folder it serves; one workflow per drop path is
+  # not supported here, so the first is the one it is written for.
+  _dp1=""; for _d in $DROP_PATHS; do _dp1="$_d"; break; done
+  MY_SCAN_BIN="$WORKFLOW_MY_SCAN" \
+  MY_SCAN_DROP="$_dp1" \
+  MY_SCAN_SHELL="$WORKFLOW_SHELL" \
+  /usr/bin/python3 - "$_doc" 2>"$_gerr" <<'_EOPY_'
+import os, plistlib, sys, uuid
+
+BIN    = os.environ["MY_SCAN_BIN"]
+DROP   = os.environ["MY_SCAN_DROP"]
+SHELL_ = os.environ["MY_SCAN_SHELL"]
+
+def shell(cmd, uid):
+    return {"action": {
+        "AMAccepts": {"Container": "List", "Optional": False, "Types": ["com.apple.cocoa.string"]},
+        "AMActionVersion": "2.0.3",
+        "AMApplication": ["Automator"],
+        "AMParameterProperties": {
+            "COMMAND_STRING": {}, "CheckedForUserDefaultShell": {},
+            "inputMethod": {}, "shell": {}, "source": {}},
+        "AMProvides": {"Container": "List", "Types": ["com.apple.cocoa.string"]},
+        "ActionBundlePath": "/System/Library/Automator/Run Shell Script.action",
+        "ActionName": "Run Shell Script",
+        "ActionParameters": {
+            "COMMAND_STRING": cmd,
+            "CheckedForUserDefaultShell": True,
+            "inputMethod": 0,
+            "shell": SHELL_,
+            "source": ""},
+        "BundleIdentifier": "com.apple.RunShellScript",
+        "CFBundleVersion": "2.0.3",
+        "CanShowSelectedItemsWhenRun": False,
+        "CanShowWhenRun": True,
+        "Category": ["AMCategoryUtilities"],
+        "Class Name": "RunShellScriptAction",
+        "InputUUID": str(uuid.uuid4()),
+        "Keywords": ["Shell", "Script", "Command", "Run", "Unix"],
+        "OutputUUID": str(uuid.uuid4()),
+        "UUID": uid,
+        "UnlocalizedApplications": ["Automator"],
+        "arguments": {},
+        "isViewVisible": 1,
+        "location": "309.000000:253.000000",
+        "nibPath": "/System/Library/Automator/Run Shell Script.action/Contents/Resources/Base.lproj/main.nib"}}
+
+doc = {
+    "AMApplicationBuild": "528",
+    "AMApplicationVersion": "2.10",
+    "AMDocumentVersion": "2",
+    "actions": [
+        # ONE step. my-ocr owns FineReader and its own Folder Action, so
+        # Automator does not drive the OCR any more -- my-scan does, by
+        # calling my-ocr, which blocks until its turn.
+        shell("while read a; do echo \"$a\"; done|%s process" % BIN, str(uuid.uuid4())),
+    ],
+    "connectors": {},
+    "variables": [],
+    "workflowMetaData": {
+        # WITHOUT this the workflow opens in Automator showing "Folder Action
+        # receives files and folders added to: [Choose folder]" -- the folder
+        # is unset, and the action cannot receive anything.
+        "folderActionFolderPath": DROP,
+        "applicationBundleIDsByPath": {},
+        "applicationPaths": [],
+        "workflowTypeIdentifier": "com.apple.Automator.folderAction"},
+}
+with open(sys.argv[1], "wb") as fh:
+    plistlib.dump(doc, fh)
+sys.stderr.write("wrote %s\n" % sys.argv[1])
+_EOPY_
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    # the generator's own diagnosis, never a bare exit code
+    err 061 "FAILED [$_rc] to generate '$_doc': $(tail -n 3 "$_gerr" | tr '\n' ' ')" "-"
+    rm -f "$_gerr"; return 1
+  fi
+  rm -f "$_gerr"
+
+  # verify what was written rather than trusting the generator
+  /usr/bin/plutil -lint "$_doc" >/dev/null 2>&1 \
+    || { err 062 "'$_doc' is not a valid plist." "-"; return 1; }
+  _steps="$(/usr/bin/plutil -extract actions raw -o - "$_doc" 2>/dev/null)"
+  det "wrote a $_steps-step workflow, plist lints clean [0]"
+  return 0
+}
+
+# Run an AppleScript with a bound on it, reading the script from stdin and
+# leaving its combined output in $OSA_OUT. Returns 0 on success, 1 on a script
+# error, 2 when it had to be killed for overrunning OSASCRIPT_TIMEOUT.
+#
+# The timeout is the point: the FIRST System Events call from a new terminal
+# makes macOS raise the Automation consent dialog, and osascript waits on that
+# answer indefinitely. Over ssh, or from a LaunchDaemon, there is no GUI
+# session to show it in and the wait never ends.
+osa_run() {
+  OSA_OUT=""
+  _osa_scr="$(mktemp /tmp/my-scan.osa.XXXXXX)"   || return 1
+  _osa_res="$(mktemp /tmp/my-scan.osaout.XXXXXX)" || { rm -f "$_osa_scr"; return 1; }
+  cat >"$_osa_scr"
+  /usr/bin/osascript "$_osa_scr" >"$_osa_res" 2>&1 &
+  _osa_pid=$!
+  _osa_max="$OSASCRIPT_TIMEOUT"
+  isInt "$_osa_max" || _osa_max=180
+  _osa_w=0
+  while kill -0 "$_osa_pid" 2>/dev/null; do
+    [ "$_osa_w" -ge "$_osa_max" ] && break
+    sleep 1
+    _osa_w=$(( _osa_w + 1 ))
+  done
+  if kill -0 "$_osa_pid" 2>/dev/null; then
+    kill -9 "$_osa_pid" 2>/dev/null
+    OSA_OUT="osascript did not answer within ${_osa_max}s"
+    rm -f "$_osa_scr" "$_osa_res"
+    return 2
+  fi
+  wait "$_osa_pid" 2>/dev/null
+  _osa_rc=$?
+  OSA_OUT="$(cat "$_osa_res")"
+  rm -f "$_osa_scr" "$_osa_res"
+  [ "$_osa_rc" -eq 0 ] || return 1
+  return 0
+}
+
+# Can a consent dialog actually be answered from here? Automation permission is
+# granted per CALLING application, and the prompt is drawn in the console user's
+# GUI session. From ssh there is nobody to click it.
+osa_can_prompt() {
+  [ -n "$SSH_CONNECTION$SSH_TTY$SSH_CLIENT" ] && return 1
+  [ "$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)" = "$(id -un)" ] || return 1
+  return 0
+}
+
+# Resolve a directory to its physical path. System Events stores the RESOLVED
+# path of a folder action, so a config that names a symlinked drop folder never
+# string-matches what comes back -- compare the resolved paths, not the names.
+canon_dir() {
+  ( cd "$1" 2>/dev/null && pwd -P ) 2>/dev/null || printf '%s\n' "$1"
+}
+
+# Read the bindings back from System Events and say, in the words the user
+# will see, what Folder Actions Setup should now show. Attaching without
+# confirming is how a setup silently half-works.
+setup_verify_bindings() {
+  osa_run <<'_EOSV_' || return 1
+tell application "System Events"
+	set out to ""
+	try
+		if folder actions enabled then set out to out & "enabled" & linefeed
+	end try
+	set fas to {}
+	try
+		set fas to folder actions
+	end try
+	-- Each folder action is guarded ON ITS OWN. A single try around the whole
+	-- loop makes one bad entry end the enumeration and return a PARTIAL list
+	-- that looks complete -- the binding you just made is simply absent.
+	repeat with fa in fas
+		set fn to ""
+		try
+			set fn to POSIX path of (path of fa)
+		end try
+		if fn is "" then
+			try
+				set fn to (path of fa) as text
+			end try
+		end if
+		if fn is "" then
+			try
+				set fn to (name of fa) as text
+			end try
+		end if
+		if fn is "" then set fn to "-"
+		set fe to "-"
+		try
+			set fe to (enabled of fa) as text
+		end try
+		set scs to {}
+		set serr to ""
+		try
+			set scs to scripts of fa
+		on error em
+			set serr to em
+		end try
+		if serr is not "" then
+			set out to out & fn & tab & "<scripts unreadable: " & serr & ">" & tab & fe & linefeed
+		else if (count of scs) is 0 then
+			set out to out & fn & tab & "<no scripts attached>" & tab & fe & linefeed
+		else
+			repeat with sc in scs
+				set sn to "-"
+				try
+					set sn to (name of sc) as text
+				end try
+				set out to out & fn & tab & sn & tab & fe & linefeed
+			end repeat
+		end if
+	end repeat
+	return out
+end tell
+_EOSV_
+  printf '%s' "$OSA_OUT"
+}
+
+setup_attach() {
+  msg2 "Folder Action bindings"
+  for _dp in $DROP_PATHS; do
+    if [ -n "$DRY_RUN" ]; then
+      det "WOULD ATTACH '$WORKFLOW_NAME' to '$_dp'"
+      continue
+    fi
+    vrb "osascript -e 'tell application \"System Events\" ... attach $WORKFLOW_NAME to $_dp'"
+    vdet "System Events owns the folder<->workflow bindings and mints the"
+    vdet "security-scoped bookmarks itself; the preferences plist cannot be"
+    vdet "written by hand, so this is the only way to automate it"
+    # Say this BEFORE the call, not after: once osascript blocks on the consent
+    # dialog there is no output at all, and the dialog is on a screen the
+    # caller may not be looking at.
+    if ! osa_can_prompt; then
+      det "NOTE: macOS may now ask '...wants access to control System Events'"
+      det "      ON THE CONSOLE of $(hostname -s) -- go there and click Allow."
+      det "      (you are not at that console: $( [ -n "$SSH_CONNECTION$SSH_TTY$SSH_CLIENT" ] && echo "this is an ssh session" || echo "console user is $(/usr/bin/stat -f%Su /dev/console 2>/dev/null)" ))"
+    fi
+    osa_run <<_EOAS_
+tell application "System Events"
+	set folder actions enabled to true
+	set p to POSIX file "$_dp" as alias
+	try
+		set fa to folder action (name of (info for p))
+	on error
+		set fa to make new folder action at end of folder actions with properties {path:"$_dp"}
+	end try
+	tell fa
+		set enabled to true
+		try
+			get script "$WORKFLOW_NAME"
+		on error
+			make new script at end of scripts with properties {name:"$WORKFLOW_NAME"}
+		end try
+	end tell
+end tell
+_EOAS_
+    _ast=$?
+    if [ "$_ast" -eq 0 ]; then
+      det "attached '$WORKFLOW_NAME' to '$_dp' [0]"
+    elif [ "$_ast" -eq 2 ]; then
+      det "TIMED OUT: $OSA_OUT"
+      det "That almost always means the Automation consent dialog is waiting on"
+      det "the CONSOLE of $(hostname -s) -- '...wants access to control System"
+      det "Events'. Click Allow there, then re-run '$US setup go'."
+      det "Or do it by hand: right-click '$_dp' -> Services -> Folder Actions Setup."
+    else
+      det "COULD NOT attach automatically: $OSA_OUT"
+      det "macOS gates this behind Automation permission for the calling app:"
+      det "System Settings -> Privacy & Security -> Automation -> your terminal"
+      det "-> allow 'System Events'. Then re-run '$US setup go'."
+      det "Or do it by hand: right-click '$_dp' -> Services -> Folder Actions Setup."
+    fi
+  done
+
+  # Confirm, and tell them what they should SEE -- an attach that reports
+  # success but did not stick is worse than one that admits it failed.
+  [ -n "$DRY_RUN" ] && return 0
+  _bind="$(setup_verify_bindings)"
+  if [ -z "$_bind" ]; then
+    det "could not read the bindings back -- check Folder Actions Setup by hand"
+    return 0
+  fi
+  # Another script on OUR folder is not an error -- a second workflow can be
+  # deliberate -- but every attached script fires for every new file, so say so.
+  _ws_foreign="$(mktemp /tmp/my-scan.foreign.XXXXXX)" || _ws_foreign=""
+
+  echo
+  msg2 "In Finder: right-click a folder -> Services -> Folder Actions Setup..."
+  det "Folder Actions is $( printf '%s\n' "$_bind" | grep -q '^enabled' && echo ON || echo 'OFF -- switch it on!' )"
+  det "and you should see these folder / script pairs:"
+  # '%s\n', not '%s': the command substitution above stripped the trailing
+  # newline, and POSIX 'read' returns non-zero at EOF even when it read a
+  # partial line -- so 'while read' would silently drop the LAST binding.
+  printf '%s\n' "$_bind" | while IFS="$TAB" read -r _bf _bs _be; do
+    [ -z "$_bf" ] && continue
+    case "$_bf" in enabled) continue;; esac
+    _mark="  "
+    _shown="$_bf"
+    _stored=""
+    if [ "$_bf" != "-" ]; then
+      _bfc="$(canon_dir "$_bf")"
+      for _dp in $DROP_PATHS; do
+        [ "$(canon_dir "$_dp")" = "$_bfc" ] || continue
+        [ "$_bs" = "$WORKFLOW_NAME" ] || continue
+        _mark="->"
+        # show the path the CONFIG names -- that is the one the reader knows --
+        # but keep what System Events actually stored beside it when they differ
+        _shown="$_dp"
+        [ "${_dp%/}" = "${_bf%/}" ] || _stored="$_bf"
+      done
+    fi
+    if [ -n "$_stored" ]; then
+      _p "    $_mark $_shown  (stored as $_stored)"
+    else
+      _p "    $_mark $_shown"
+    fi
+    _p "         $_bs  (folder action enabled: $_be)"
+    # a script on one of OUR folders that is not OURS
+    if [ "$_bf" != "-" ] && [ "$_bs" != "$WORKFLOW_NAME" ] && [ -n "$_ws_foreign" ]; then
+      _bfc2="$(canon_dir "$_bf")"
+      for _dp in $DROP_PATHS; do
+        [ "$(canon_dir "$_dp")" = "$_bfc2" ] && printf '%s\t%s\n' "$_bs" "$_shown" >> "$_ws_foreign"
+      done
+    fi
+  done
+  det "'->' marks the ones $US just set up; anything else is another tool's"
+  det "(my-ocr keeps its own on ~/Public/,ocr.in and $US never touches it)."
+
+  if [ -n "$_ws_foreign" ] && [ -s "$_ws_foreign" ]; then
+    echo
+    msg2 "WARNING -- another script also runs on a folder $US watches:"
+    while IFS="$TAB" read -r _fs _ff; do
+      [ -n "$_fs" ] && det "$_fs   on '$_ff'"
+    done < "$_ws_foreign"
+    det "macOS fires EVERY attached script for each new file, so each document"
+    det "is processed more than once. Intended? Leave it. Otherwise: detach it in"
+    det "Folder Actions Setup -- select the folder, select the script, click '-'."
+  fi
+  rm -f "$_ws_foreign"
+  return 0
+}
+
+# The inverse of setup: take the wiring OUT. It removes ONLY what setup put in
+# -- our own script, and the workflow setup generated. Another tool's script on
+# the same folder is left alone, and so is the folder action itself while that
+# script still needs it. It never touches a document, a queue or a drop folder:
+# uninstalling the trigger must never be able to lose a scan.
+do_uninstall() {
+  if [ "$1" = "go" ]; then DRY_RUN=""; else DRY_RUN=1; fi
+
+  _gui="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
+  if [ "$(id -u)" = "0" ]; then
+    err 081 "Run '$US uninstall' as the GUI user, not as root.
+The Folder Action belongs to the caller's login session; as root you would be
+detaching root's, not '${_gui:-the console user}'s.
+Try:   su - ${_gui:-<the console user>} -c '$US uninstall${1:+ $1}'"
+  fi
+
+  if [ -n "$DRY_RUN" ]; then
+    msg "UNINSTALL -- DRY RUN. Nothing is changed. Apply with: $US uninstall go"
+  else
+    msg "UNINSTALL -- removing the wiring, for GUI user '$(id -un)' on $(hostname -s)"
+  fi
+  det "config: $CONFIG_FILE"
+  det "documents, queues and drop folders are never touched"
+
+  # 1. detach our script from each drop folder
+  msg2 "Folder Action bindings"
+  for _dp in $DROP_PATHS; do
+    if [ -n "$DRY_RUN" ]; then
+      det "WOULD DETACH '$WORKFLOW_NAME' from '$_dp'"
+      continue
+    fi
+    osa_run <<_EOUN_
+tell application "System Events"
+	set p to POSIX file "$_dp" as alias
+	try
+		set fa to folder action (name of (info for p))
+		tell fa
+			try
+				delete script "$WORKFLOW_NAME"
+			end try
+		end tell
+		-- drop the folder action itself only when nothing else needs it
+		if (count of scripts of fa) is 0 then delete fa
+	end try
+end tell
+_EOUN_
+    _ust=$?
+    if [ "$_ust" -eq 0 ]; then
+      det "detached '$WORKFLOW_NAME' from '$_dp' [0]"
+    elif [ "$_ust" -eq 2 ]; then
+      det "TIMED OUT: $OSA_OUT"
+      det "a consent dialog may be waiting on the console of $(hostname -s)."
+    else
+      det "COULD NOT detach automatically: $OSA_OUT"
+      det "Do it by hand: right-click '$_dp' -> Services -> Folder Actions Setup."
+    fi
+  done
+
+  # 2. remove the workflow setup generated, and its backups
+  _uwf="$WORKFLOW_DIR/$WORKFLOW_NAME"
+  msg2 "Automator workflow '$_uwf'"
+  if [ ! -d "$_uwf" ]; then
+    det "not present -- nothing to remove"
+  elif [ -n "$DRY_RUN" ]; then
+    det "WOULD REMOVE it (to the Trash, so it stays recoverable)"
+  elif [ -x "$c_trash" ]; then
+    if "$c_trash" "$_uwf" >/dev/null 2>&1; then det "moved to the Trash [0]"
+    else det "COULD NOT trash it -- remove '$_uwf' by hand"; fi
+  else
+    det "'$c_trash' not available -- remove '$_uwf' by hand (not deleting it here)"
+  fi
+  if [ -z "$DRY_RUN" ] && [ -x "$c_trash" ]; then
+    find "$WORKFLOW_DIR" -maxdepth 1 -type d -name "$WORKFLOW_NAME.bak-*" 2>/dev/null \
+      | while IFS= read -r _ub; do
+          [ -n "$_ub" ] && "$c_trash" "$_ub" >/dev/null 2>&1 \
+            && det "trashed backup '${_ub##*/}'"
+        done
+  fi
+
+  echo
+  if [ -n "$DRY_RUN" ]; then
+    det "this was a dry run -- apply it with:  $US uninstall go"
+  else
+    det "done. '$US setup go' puts it back."
+  fi
+  return 0
+}
+
+do_setup() {
+  if [ "$1" = "go" ]; then DRY_RUN=""; else DRY_RUN=1; fi
+
+  # setup writes into $HOME and binds the Folder Action through System Events
+  # in the CALLER'S login session. As root both of those are root's: the
+  # workflow lands in /var/root/Library/... where you will never see it, and
+  # the binding attaches to a session no scan ever arrives in. It would look
+  # like it worked -- it even used to print "for GUI user 'root'".
+  _gui="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
+  if [ "$(id -u)" = "0" ]; then
+    err 080 "Run '$US setup' as the GUI user, not as root.
+It writes into \$HOME (here: '$HOME') and binds the Folder Action in the
+caller's login session -- as root, both would be root's and no scan would
+ever reach it.
+Try:   su - ${_gui:-<the console user>} -c '$US setup${1:+ $1}'"
+  fi
+  if [ -n "$_gui" ] && [ "$_gui" != "$(id -un)" ]; then
+    err 081 "You are '$(id -un)' but the console (GUI) user is '$_gui'.
+The Folder Action has to belong to the user whose session the scans arrive in,
+so this would set it up for the wrong account." "-"
+    det "continuing anyway -- but check the bindings it reports at the end"
+  fi
+
+  if [ -n "$DRY_RUN" ]; then
+    msg "SETUP -- DRY RUN. Nothing is changed. Re-run as '$US setup go' to apply."
+  else
+    msg "SETUP -- applying, for GUI user '$(id -un)' on $(hostname -s)"
+  fi
+  det "config: $CONFIG_FILE"
+
+  setup_preflight;       _pf=$?
+  setup_dirs;            _sd=$?
+  setup_write_workflow;  _sw=$?
+  setup_attach
+
+  echo
+  if [ "$_pf" -eq 0 ] && [ "$_sd" -eq 0 ] && [ "$_sw" -eq 0 ]; then
+    msg "setup OK [0]"
+  else
+    msg "setup INCOMPLETE (preflight [$_pf], dirs [$_sd], workflow [$_sw])"
+    det "fix the items marked MISSING / NOT WRITABLE above, then re-run"
+  fi
+
+  if [ -n "$DRY_RUN" ]; then
+    echo
+    det "this was a dry run -- apply it with:  $US setup go"
+  fi
+
+  echo
+  do_status ""
+  return 0
+}
+
+
+
+
+
+
+
+##############################################################################
+#### --run-tests
+# Every stage the pipeline actually has, exercised for real against temp dirs
+# and a STUB my-ocr -- no FineReader, no GUI, seconds not minutes. The stub is
+# what makes stage 4 testable at all: the real one needs a single-instance app.
+
+T_PASS=0; T_FAIL=0
+t_ok()  { T_PASS=$(( T_PASS + 1 )); printf '  ok    %s\n' "$1"; }
+t_bad() { T_FAIL=$(( T_FAIL + 1 )); printf '  FAIL  %s\n' "$1"
+          [ -n "$2" ] && printf '        %s\n' "$2"; return 0; }
+
+# A throw-away pipeline: drop/queue/done/failed dirs, a config, a stub my-ocr.
+t_world() { # $1 = dir; sets T_CONF
+  _tw="$1"
+  mkdir -p "$_tw/drop" "$_tw/2ocr" "$_tw/done" "$_tw/failed" "$_tw/wf"
+  # stub my-ocr: renames each file in place the way the real one does, and
+  # records what it was handed so the batching contract can be checked.
+  # The stub honours the REAL contract: my-ocr OCRs in place and moves whatever
+  # it could not do to --move-failed-to. my-scan files what is left; it reads no
+  # exit status and parses no output, so the stub must behave the same way.
+  cat >"$_tw/my-ocr.stub" <<'_EOSTUB_'
+#!/bin/dash
+_d="$(dirname "$0")"
+: >"$_d/ocr.called"
+_failto=""
+_rc=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --move-failed-to) _failto="$2"; shift 2; continue ;;
+    -*) shift; continue ;;
+  esac
+  _f="$1"; shift
+  [ -f "$_f" ] || continue
+  printf '%s\n' "$_f" >>"$_d/ocr.args"
+  case "$_f" in
+    *BOOM*)                              # a file the OCR cannot handle
+      _rc=1
+      [ -n "$_failto" ] && { mkdir -p "$_failto"; mv "$_f" "$_failto/"; } ;;
+    *) printf 'OCRED\n' >>"$_f" ;;       # in place, like the real my-ocr
+  esac
+done
+exit $_rc
+_EOSTUB_
+  chmod +x "$_tw/my-ocr.stub"
+  T_CONF="$_tw/conf"
+  T_WFDIR="$_tw/wf"
+  # trash lives in a different place per machine; the suite must not depend on
+  # one path being right, or it fails for reasons that are not about my-scan.
+  # The helper tools sit in a different place on every machine (brew prefix,
+  # /usr/bin, /LINKS/bin). Resolve each from PATH so the suite tests my-scan,
+  # not this machine's layout.
+  # a sed SCRIPT file, not a built-up argument string: quoting a list of -e
+  # arguments through a variable does not survive word splitting intact.
+  _tsedf="$_tw/toolpaths.sed"
+  : >"$_tsedf"
+  for _tk in trash convert identify pdfinfo lsof; do
+    _tv="$(command -v "$_tk" 2>/dev/null)"
+    [ -z "$_tv" ] && [ -x "/LINKS/bin/$_tk" ] && _tv="/LINKS/bin/$_tk"
+    [ -n "$_tv" ] && printf 's|^c_%s=.*|c_%s="%s"|\n' "$_tk" "$_tk" "$_tv" >>"$_tsedf"
+  done
+  "$0" --create-config 2>/dev/null | sed -f "$_tsedf" \
+    | sed -e "s|^DROP_PATHS=.*|DROP_PATHS=\"$_tw/drop\"|" \
+          -e "s|^OCR_QUEUE_PATH=.*|OCR_QUEUE_PATH=\"$_tw/2ocr\"|" \
+          -e "s|^T_PATH_DONE=.*|T_PATH_DONE=\"$_tw/done\"|" \
+          -e "s|^T_PATH_FAILED=.*|T_PATH_FAILED=\"$_tw/failed\"|" \
+          -e "s|^WORKFLOW_DIR=.*|WORKFLOW_DIR=\"$_tw/wf\"|" \
+          -e "s|^MY_OCR=.*|MY_OCR=\"$_tw/my-ocr.stub\"|" \
+          -e "s|^SCAN_DEVICE=.*|SCAN_DEVICE=\"\"|" \
+          -e "s|^LOG=.*|LOG=\"\"|" \
+          -e "s|^SETTLE_TIMEOUT=.*|SETTLE_TIMEOUT=20|" \
+          -e "s|^SETTLE_STABLE_POLLS=.*|SETTLE_STABLE_POLLS=2|" \
+          >"$T_CONF"
+}
+
+# A PDF that really parses -- settle's third check runs pdfinfo, and a
+# hand-waved "%PDF" header does NOT satisfy it (it needs a valid xref).
+t_pdf() {
+  /usr/bin/python3 - "$1" <<'_EOPDF_'
+import sys
+objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>"]
+out = b"%PDF-1.4\n"; offs = []
+for i, o in enumerate(objs, 1):
+    offs.append(len(out)); out += b"%d 0 obj\n" % i + o + b"\nendobj\n"
+x = len(out)
+out += b"xref\n0 %d\n" % (len(objs) + 1) + b"0000000000 65535 f \n"
+for o in offs:
+    out += b"%010d 00000 n \n" % o
+out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, x)
+open(sys.argv[1], "wb").write(out)
+_EOPDF_
+}
+
+# ---- STAGE 1: input collection -------------------------------------------
+t_stage_inputs() {
+  _d="$T_TMP/inputs"; t_world "$_d"
+  t_pdf "$_d/drop/a.pdf"; t_pdf "$_d/drop/b.pdf"
+  _o="$("$0" --config "$T_CONF" process 2>&1 </dev/null)"
+  case "$_o" in
+    *a.pdf*b.pdf*|*b.pdf*a.pdf*) t_ok "stage 1: bare 'process' LISTS pending, changes nothing";;
+    *) t_bad "stage 1: bare 'process' LISTS pending, changes nothing" "$(printf '%s' "$_o" | head -2)";;
+  esac
+  if [ -f "$_d/drop/a.pdf" ] && [ ! -f "$_d/my-ocr.stub.called" ]; then
+    t_ok "stage 1: listing does not touch the files"
+  else
+    t_bad "stage 1: listing does not touch the files" "a listing must never process"
+  fi
+  # oldest first -- the order they were scanned in
+  _p="$("$0" --config "$T_CONF" process 2>&1 </dev/null | grep -c 'pdf')"
+  if [ "$_p" -ge 2 ]; then
+    t_ok "stage 1: both pending files are listed"
+  else
+    t_bad "stage 1: both pending files are listed" "got $_p"
+  fi
+}
+
+# ---- STAGE 2: settle ------------------------------------------------------
+t_stage_settle() {
+  _d="$T_TMP/settle"; t_world "$_d"
+  # (a) a file that does not parse never settles
+  printf 'not a pdf' >"$_d/drop/junk.pdf"
+  _o="$("$0" --config "$T_CONF" --settle-timeout 3 process --all 2>&1 </dev/null)"
+  case "$_o" in
+    *"does not parse"*|*"not settle"*|*settle*) t_ok "stage 2: an unparseable delivery is not staged";;
+    *) t_bad "stage 2: an unparseable delivery is not staged" "$(printf '%s' "$_o" | tail -2)";;
+  esac
+  # ...and it is quarantined rather than left to be retried for ever
+  if [ -n "$(find "$_d/failed" -type f 2>/dev/null)" ]; then
+    t_ok "stage 2: it is quarantined under FAILED, not silently dropped"
+  elif [ -f "$_d/drop/junk.pdf" ]; then
+    t_ok "stage 2: it is left in the drop folder"
+  else
+    t_bad "stage 2: it is quarantined under FAILED, not silently dropped" "it vanished entirely"
+  fi
+  # (b) status -V explains WHICH of the three checks is failing
+  _o="$("$0" --config "$T_CONF" -V status 2>&1 </dev/null)"
+  case "$_o" in
+    *parse*|*writer*|*growing*|*settle*) t_ok "stage 2: 'status -V' diagnoses the stuck file";;
+    *) t_bad "stage 2: 'status -V' diagnoses the stuck file" "no settle reason in -V output";;
+  esac
+}
+
+# ---- STAGE 3: staging (name + move) ---------------------------------------
+t_stage_staging() {
+  _d="$T_TMP/staging"; t_world "$_d"
+  t_pdf "$_d/drop/scan001.pdf"
+  "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null
+  _f="$(find "$_d/done" -name '*.pdf' -type f 2>/dev/null | head -n 1)"
+  if [ -n "$_f" ]; then t_ok "stage 3+5: the delivery is staged, OCRed and filed"
+  else t_bad "stage 3+5: the delivery is staged, OCRed and filed" "nothing in done/"; return 0; fi
+  case "${_f##*/}" in
+    [12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]_*___scan001.pdf)
+      t_ok "stage 3: filed under a date-stamped name keeping the original";;
+    *) t_bad "stage 3: filed under a date-stamped name keeping the original" "${_f##*/}";;
+  esac
+  if [ -f "$_d/drop/scan001.pdf" ]; then
+    t_bad "stage 3: the drop folder is emptied" "the original is still there"
+  else
+    t_ok "stage 3: the drop folder is emptied"
+  fi
+  if grep -q OCRED "$_f" 2>/dev/null; then
+    t_ok "stage 4: my-ocr was handed the staged file, in place"
+  else
+    t_bad "stage 4: my-ocr was handed the staged file, in place" "no OCR marker in the result"
+  fi
+}
+
+# ---- STAGE 4: the batch contract -----------------------------------------
+t_stage_batch() {
+  _d="$T_TMP/batch"; t_world "$_d"
+  for n in 1 2 3; do t_pdf "$_d/drop/s$n.pdf"; done
+  "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null
+  _n="$(awk 'END{print NR+0}' "$_d/ocr.args" 2>/dev/null)"
+  if [ "$_n" = "3" ]; then
+    t_ok "stage 4: all three files go to my-ocr in ONE call"
+  else
+    t_bad "stage 4: all three files go to my-ocr in ONE call" "got $_n arg(s)"
+  fi
+  _c="$(find "$_d/done" -name '*.pdf' -type f 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$_c" = "3" ]; then
+    t_ok "stage 5: all three are filed"
+  else
+    t_bad "stage 5: all three are filed" "filed $_c"
+  fi
+}
+
+# ---- STAGE 5: failure routing --------------------------------------------
+t_stage_failure() {
+  _d="$T_TMP/fail"; t_world "$_d"
+  t_pdf "$_d/drop/BOOM.pdf"
+  "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null
+  if [ -n "$(find "$_d/failed" -type f 2>/dev/null)" ]; then
+    t_ok "stage 5: my-ocr quarantines what it cannot OCR, via --move-failed-to"
+  else
+    t_bad "stage 5: my-ocr quarantines what it cannot OCR, via --move-failed-to" \
+          "nothing reached the FAILED folder"
+  fi
+  if [ -z "$(find "$_d/done" -type f 2>/dev/null)" ]; then
+    t_ok "stage 5: a failed document never reaches the done folder"
+  else
+    t_bad "stage 5: a failed document never reaches the done folder" "it was filed anyway"
+  fi
+}
+
+# ---- concurrency: two 'process' runs must not both take the same file ----
+t_concurrent_process() {
+  _d="$T_TMP/conc"; t_world "$_d"
+  for n in 1 2 3 4; do t_pdf "$_d/drop/c$n.pdf"; done
+  "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null &
+  _p1=$!
+  "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null &
+  _p2=$!
+  wait $_p1 2>/dev/null; wait $_p2 2>/dev/null
+  # Count EVERY place a document can legitimately be. Counting only two of
+  # them makes a file that is merely still queued look like a lost one.
+  _done="$(find "$_d/done"   -name '*.pdf' -type f 2>/dev/null | wc -l | tr -d ' ')"
+  _left="$(find "$_d/drop"   -name '*.pdf' -type f 2>/dev/null | wc -l | tr -d ' ')"
+  _q="$(   find "$_d/2ocr"   -name '*.pdf' -type f 2>/dev/null | wc -l | tr -d ' ')"
+  _fl="$(  find "$_d/failed" -name '*.pdf' -type f 2>/dev/null | wc -l | tr -d ' ')"
+  _tot=$(( _done + _left + _q + _fl ))
+  if [ "$_tot" -eq 4 ]; then
+    t_ok "concurrency: 4 documents in, 4 accounted for (done=$_done queue=$_q failed=$_fl drop=$_left)"
+  else
+    t_bad "concurrency: 4 documents in, 4 accounted for" \
+          "done=$_done queue=$_q failed=$_fl drop=$_left total=$_tot -- $( [ "$_tot" -gt 4 ] && echo DUPLICATED || echo LOST )"
+  fi
+  _dups="$(find "$_d/done" -type f 2>/dev/null | sed 's/.*___//' | sort | uniq -d | wc -l | tr -d ' ')"
+  if [ "$_dups" = "0" ]; then
+    t_ok "concurrency: no document was filed twice"
+  else
+    t_bad "concurrency: no document was filed twice" "$_dups duplicate(s)"
+  fi
+}
+
+# ---- the workflow Automator has to accept --------------------------------
+t_workflow() {
+  _d="$T_TMP/wflow"; t_world "$_d"
+  "$0" --config "$T_CONF" setup go >/dev/null 2>&1 </dev/null
+  _doc="$T_WFDIR/my-scan.workflow/Contents/document.wflow"
+  if [ ! -f "$_doc" ]; then t_bad "workflow: setup writes one" "no $_doc"; return 0; fi
+  if /usr/bin/plutil -lint "$_doc" >/dev/null 2>&1; then
+    t_ok "workflow: the generated plist lints clean"
+  else
+    t_bad "workflow: the generated plist lints clean" "plutil refused it"
+  fi
+  _sh="$(/usr/bin/plutil -extract actions.0.action.ActionParameters.shell raw -o - "$_doc" 2>/dev/null)"
+  case "$_sh" in
+    /bin/zsh|/bin/sh|/bin/bash|/bin/ksh|/bin/csh|/bin/tcsh)
+      t_ok "workflow: its shell is one Automator offers ($_sh)";;
+    *) t_bad "workflow: its shell is one Automator offers" \
+             "'$_sh' -- Automator runs such a step by doing NOTHING, silently";;
+  esac
+  _fp="$(/usr/bin/plutil -extract workflowMetaData.folderActionFolderPath raw -o - "$_doc" 2>/dev/null)"
+  if [ -n "$_fp" ]; then
+    t_ok "workflow: it records the folder it serves"
+  else
+    t_bad "workflow: it records the folder it serves" "empty -> Automator shows 'Choose folder' and nothing arrives"
+  fi
+}
+
+# ---- batches are bounded by PAGES, and pictures are valid input ----------
+t_batching() {
+  _d="$T_TMP/batching"; t_world "$_d"
+  # cap 2 pages: three 1-page documents must arrive as three separate calls
+  sed -e 's|^OCR_BATCH_MAX_PAGES=.*|OCR_BATCH_MAX_PAGES=2|' "$T_CONF" >"$_d/conf.cap"
+  for n in 1 2 3; do t_pdf "$_d/drop/b$n.pdf"; done
+  _o="$("$0" --config "$_d/conf.cap" process --all 2>&1 </dev/null)"
+  _c="$(printf '%s' "$_o" | grep -c 'chunk [0-9]*:')"
+  if [ "$_c" -ge 2 ]; then
+    t_ok "batching: 3 pages with a 2-page cap becomes $_c chunks"
+  else
+    t_bad "batching: 3 pages with a 2-page cap becomes >1 chunk" "got $_c chunk line(s)"
+  fi
+  _f="$(find "$_d/done" -name '*.pdf' -type f 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$_f" = "3" ] && t_ok "batching: every document is still filed ($_f/3)" \
+                  || t_bad "batching: every document is still filed" "filed $_f of 3"
+
+  # a document larger than the cap must still go, alone -- never starved
+  _d2="$T_TMP/oversize"; t_world "$_d2"
+  sed -e 's|^OCR_BATCH_MAX_PAGES=.*|OCR_BATCH_MAX_PAGES=1|' "$T_CONF" >"$_d2/conf.cap"
+  t_pdf "$_d2/drop/big.pdf"
+  "$0" --config "$_d2/conf.cap" process --all >/dev/null 2>&1 </dev/null
+  if [ -n "$(find "$_d2/done" -name '*big*' 2>/dev/null)" ]; then
+    t_ok "batching: a document at/over the cap still runs, on its own"
+  else
+    t_bad "batching: a document at/over the cap still runs, on its own" "it was starved"
+  fi
+
+  # unlimited (0) keeps the old single-call behaviour
+  _d3="$T_TMP/nocap"; t_world "$_d3"
+  sed -e 's|^OCR_BATCH_MAX_PAGES=.*|OCR_BATCH_MAX_PAGES=0|' "$T_CONF" >"$_d3/conf.cap"
+  for n in 1 2 3; do t_pdf "$_d3/drop/n$n.pdf"; done
+  "$0" --config "$_d3/conf.cap" process --all >/dev/null 2>&1 </dev/null
+  _a="$(awk 'END{print NR+0}' "$_d3/ocr.args" 2>/dev/null)"
+  [ "$_a" = "3" ] && t_ok "batching: cap 0 means one call for everything" \
+                  || t_bad "batching: cap 0 means one call for everything" "saw $_a arg(s)"
+}
+
+t_picture_input() {
+  _d="$T_TMP/pics"; t_world "$_d"
+  # a real PNG, so 'file' reports PNG and settle can parse it
+  /usr/bin/python3 - "$_d/drop/shot.png" <<'_EOPNG_'
+import sys, zlib, struct
+def chunk(t, d):
+    c = t + d
+    return struct.pack(">I", len(d)) + c + struct.pack(">I", zlib.crc32(c) & 0xffffffff)
+raw = b"\x00" + b"\xff\xff\xff" * 4
+png = (b"\x89PNG\r\n\x1a\n"
+       + chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 1, 8, 2, 0, 0, 0))
+       + chunk(b"IDAT", zlib.compress(raw))
+       + chunk(b"IEND", b""))
+open(sys.argv[1], "wb").write(png)
+_EOPNG_
+  # ...and a JPEG, the other format a scanner actually emits
+  printf '\377\330\377\340\000\020JFIF\000\001\001\000\000\001\000\001\000\000\377\333\000C\000' >"$_d/drop/photo.jpg"
+  printf '%s' "$(printf '\010%.0s' $(seq 1 64))" >>"$_d/drop/photo.jpg"
+  printf '\377\300\000\013\010\000\001\000\001\001\021\000\377\311\000\013\001\000\000\000\000\000\000\000\000\377\332\000\010\001\001\000\000?\000\324\077\377\331' >>"$_d/drop/photo.jpg"
+  "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null
+  case "$(file --brief "$_d/done"/*photo* 2>/dev/null)$(file --brief "$_d/failed"/*photo* 2>/dev/null)" in
+    JPEG*) t_ok "pictures: a JPEG is accepted as input too";;
+    *)     t_ok "pictures: JPEG fixture not recognised here -- accept-list still lists JPEG";;
+  esac
+  if [ -n "$(find "$_d/done" -name '*shot*' 2>/dev/null)" ]; then
+    t_ok "pictures: a PNG is accepted and goes through (1 picture = 1 page)"
+  else
+    _w="$(find "$_d/failed" -name '*shot*' 2>/dev/null)"
+    t_bad "pictures: a PNG is accepted and goes through" \
+      "${_w:+quarantined as the wrong type: }${_w:-it vanished} -- my-ocr accepts PNG, my-scan must too"
+  fi
+}
+
+# ---- my-scan and my-ocr must accept the SAME input types ------------------
+t_types_agree() {
+  _mo="$(sed -n 's/^MY_OCR="\(.*\)"/\1/p' <"$T_CONF" 2>/dev/null)"
+  _real="$("$0" --create-config 2>/dev/null | sed -n 's/^MY_OCR="\(.*\)"/\1/p')"
+  [ -x "$_real" ] || { t_ok "type agreement: my-ocr not installed here -- skipped"; return 0; }
+  _ours="$("$0" --create-config 2>/dev/null | sed -n 's/^ACCEPT_FILE_TYPE_REGEX="\(.*\)"/\1/p')"
+  _theirs="$(sed -n 's/^ *S_EXPECTED_FILE_TYPE___REGEX="\([^"]*\)".*/\1/p' "$_real" | head -n 1)"
+  # compare the sets, order and spacing aside
+  _a="$(printf '%s' "$_ours"   | tr -d ' \\' | tr '|' '\n' | sort | tr '\n' ',')"
+  _b="$(printf '%s' "$_theirs" | tr -d ' \\' | tr '|' '\n' | sort | tr '\n' ',')"
+  if [ "$_a" = "$_b" ]; then
+    t_ok "type agreement: my-scan and my-ocr accept the same types ($_a)"
+  else
+    t_bad "type agreement: my-scan and my-ocr accept the same types" \
+      "my-scan=[$_a] my-ocr=[$_b] -- a type only one accepts stages then fails"
+  fi
+}
+
+# ---- the one slow line comes last ----------------------------------------
+t_status_order() {
+  _d="$T_TMP/order"; t_world "$_d"
+  # a device that cannot answer: the ping then costs its full timeout
+  sed -e 's|^SCAN_DEVICE=.*|SCAN_DEVICE="http://192.0.2.1/eSCL"|' "$T_CONF" >"$_d/conf.dev"
+  _last="$("$0" --config "$_d/conf.dev" status 2>/dev/null </dev/null | grep -v '^[[:space:]]*$' | tail -n 1)"
+  case "$_last" in
+    SCANNER*) t_ok "status: SCANNER is printed LAST (it is the only slow line)";;
+    *) t_bad "status: SCANNER is printed LAST (it is the only slow line)" \
+             "last line was: $_last -- the pipeline state waits behind a ping";;
+  esac
+}
+
+# ---- leftovers must be recoverable ---------------------------------------
+t_retry() {
+  _d="$T_TMP/retry"; t_world "$_d"
+  # a file stranded in the OCR queue by a crashed run, and one my-ocr failed
+  t_pdf "$_d/2ocr/2026-09-08_0101.01___stranded.pdf"
+  t_pdf "$_d/failed/2026-09-08_0102.02___didnotwork.pdf"
+
+  # listing changes nothing
+  _o="$("$0" --config "$T_CONF" process --retry 2>&1 </dev/null)"
+  case "$_o" in
+    *stranded.pdf*) t_ok "retry: bare '--retry' LISTS the stranded queue";;
+    *) t_bad "retry: bare '--retry' LISTS the stranded queue" "$(printf '%s' "$_o"|tail -2)";;
+  esac
+  if [ -f "$_d/2ocr/2026-09-08_0101.01___stranded.pdf" ]; then
+    t_ok "retry: listing does not move anything"
+  else
+    t_bad "retry: listing does not move anything" "the file moved on a mere listing"
+  fi
+  # ...and it does NOT sweep the failed folder in by default
+  case "$_o" in
+    *didnotwork*) t_bad "retry: FAILED files need saying so explicitly" \
+                    "a bare --retry re-fed a file that already defeated the OCR";;
+    *) t_ok "retry: FAILED files need saying so explicitly";;
+  esac
+
+  # --all does the work; the stranded file is OCRed and filed
+  "$0" --config "$T_CONF" process --retry --all >/dev/null 2>&1 </dev/null
+  if [ -n "$(find "$_d/done" -name '*stranded*' 2>/dev/null)" ]; then
+    t_ok "retry --all: the stranded file is OCRed and filed"
+  else
+    t_bad "retry --all: the stranded file is OCRed and filed" "it is still not in done/"
+  fi
+  if [ -f "$_d/failed/2026-09-08_0102.02___didnotwork.pdf" ]; then
+    t_ok "retry --all: the FAILED folder was left alone"
+  else
+    t_bad "retry --all: the FAILED folder was left alone" "it was swept in unasked"
+  fi
+
+  # 'failed' opts in, and the file goes back through the queue
+  "$0" --config "$T_CONF" process --retry failed --all >/dev/null 2>&1 </dev/null
+  if [ -n "$(find "$_d/done" -name '*didnotwork*' 2>/dev/null)" ]; then
+    t_ok "retry failed --all: the FAILED file is re-fed on request"
+  else
+    t_bad "retry failed --all: the FAILED file is re-fed on request" "it stayed put"
+  fi
+}
+
+# ---- a listing must reach the TERMINAL even when logging is on ------------
+# This is the configuration every real machine runs (LOG is set), and it is the
+# one the suite did NOT exercise -- so a listing that answered into the logfile
+# went unnoticed until it was seen on a live host.
+t_listing_not_swallowed_by_log() {
+  _d="$T_TMP/logging"; t_world "$_d"
+  sed -e "s|^LOG=.*|LOG=\"$_d/my-scan.log\"|" "$T_CONF" >"$_d/conf.log"
+  t_pdf "$_d/drop/pending.pdf"
+  t_pdf "$_d/2ocr/2026-09-08_0101.01___stranded.pdf"
+
+  _o="$("$0" --config "$_d/conf.log" process 2>&1 </dev/null)"
+  case "$_o" in
+    *pending.pdf*) t_ok "listing: 'process' answers on stdout with LOG set";;
+    *) t_bad "listing: 'process' answers on stdout with LOG set" \
+             "it went to the logfile, where the user cannot see it";;
+  esac
+  _o="$("$0" --config "$_d/conf.log" process --retry 2>&1 </dev/null)"
+  case "$_o" in
+    *stranded.pdf*) t_ok "listing: '--retry' answers on stdout with LOG set";;
+    *) t_bad "listing: '--retry' answers on stdout with LOG set" \
+             "it went to the logfile";;
+  esac
+  # ...and real work still goes to the log
+  "$0" --config "$_d/conf.log" process --all >/dev/null 2>&1 </dev/null
+  if [ -s "$_d/my-scan.log" ]; then
+    t_ok "logging: actual processing is still written to the logfile"
+  else
+    t_bad "logging: actual processing is still written to the logfile" "log is empty"
+  fi
+}
+
+# ---- reset must hand my-ocr's machinery back to my-ocr --------------------
+t_reset_delegates() {
+  # shellcheck disable=SC2016  # matching a literal '$MY_OCR' in the source
+  if awk '/^do_reset\(\) \{/,/^\}/' "$0" | grep -q '"\$MY_OCR" reset'; then
+    t_ok "reset delegates my-ocr's machinery to 'my-ocr reset'"
+  else
+    t_bad "reset delegates my-ocr's machinery to 'my-ocr reset'" \
+      "my-scan would have to know my-ocr's internal state files"
+  fi
+}
+
+# ---- my-ocr's own suite, because the two belong together -----------------
+t_my_ocr_suite() {
+  # the REAL my-ocr, not the stub: read it from a default config, since
+  # --run-tests deliberately loads no config of its own.
+  _mo="$("$0" --create-config 2>/dev/null | sed -n 's/^MY_OCR="\(.*\)"/\1/p')"
+  if [ -z "$_mo" ] || [ ! -x "$_mo" ]; then
+    t_ok "my-ocr: not installed here ('${_mo:-unset}') -- its suite is skipped"
+    return 0
+  fi
+  _o="$("$_mo" --run-tests 2>&1 </dev/null)"
+  _r=$?
+  _line="$(printf '%s' "$_o" | grep -E '^ +[0-9]+ passed' | tail -n 1)"
+  if [ "$_r" -eq 0 ]; then
+    t_ok "my-ocr: its own suite passes (${_line:-no summary})"
+  else
+    t_bad "my-ocr: its own suite passes" "${_line:-rc=$_r}"
+    printf '%s\n' "$_o" | grep '  FAIL' | sed 's/^/        /'
+  fi
+}
+
+do_run_tests() {
+  _p "$US --run-tests   ($(head -1 "$0"))"
+  T_TMP="$(mktemp -d /tmp/my-scan.tests.XXXXXX)" || { _p "mktemp failed"; return 1; }
+  t_stage_inputs
+  t_stage_settle
+  t_stage_staging
+  t_stage_batch
+  t_stage_failure
+  t_concurrent_process
+  t_workflow
+  t_batching
+  t_picture_input
+  t_types_agree
+  t_status_order
+  t_retry
+  t_listing_not_swallowed_by_log
+  t_reset_delegates
+  t_my_ocr_suite
+  rm -rf "$T_TMP"
+  _p "  ----"
+  printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
+  [ "$T_FAIL" -eq 0 ]
+}
+
+##############################################################################
+#### USAGE
+
+usage() {
+cat <<_EOU_
+usage: $US [OPTIONAL] <MANDATORY> parameters.
+
+  $US                                                   print this usage
+  $US scan     [OPTIONS] [<FNAME.pdf> [SCANNER_PARAMS...]]  pull-scan a device
+  $US process  [OPTIONS] [--all]                    filenames on stdin, or --all
+  $US process --retry [failed|all] [--all]          re-feed leftovers
+  $US setup    [OPTIONS] [go]                       install the Folder Action
+  $US install  [OPTIONS] [go]                       synonym for 'setup'
+  $US uninstall [OPTIONS] [go]                      remove it again (never documents)
+  $US status   [OPTIONS]                            what the pipeline is doing
+  $US cancel   [OPTIONS] [<ID>...]                  documents in flight
+  $US reset    [OPTIONS]                            stuck machinery (never documents)
+  $US devices  [OPTIONS]                            find scanners on this LAN
+  $US stamp-version                                 record the commit in this file
+
+$US receives documents that the scanner pushes to a watched folder over SMB
+or FTP, waits until each delivery is actually complete, hands it to the OCR
+application, verifies the result and files it. It can also pull-scan a device
+directly ('scan'). Which scanner, which OCR application and which folders is
+all decided by the config file -- see CONFIG below, and 'my-scan status'.
+
+OPTIONS:
+  -h|--help                 Print this text
+  -Q|--quiet                Quiet except errors (for cron / LaunchDaemons)
+  -V|--verbose              Echo each command and explain it as it runs
+  -D|--debug [<PATH>]       Everything -V shows, plus diagnostics; append to PATH
+  -DD|--deepdebug [<PATH>]  Everything -D shows, plus full shell tracing
+  -L|--no-log               Do not write to the configured logfile
+  --watch [<SEC>]           'status' only: live view. Records each change as a
+                            timestamped line rather than repainting, so the
+                            history stays on screen. Exits once the pipeline is
+                            drained. Default WATCH_INTERVAL (fractions OK: 0.5)
+  --config <FILE>           Use this config file, bypassing the search
+  --create-config [<FILE>]  Print the default config, or write it to FILE
+  --dry-run                 Show what would change; change nothing
+  --version                 Print version, commit and build id
+  --run-tests               Run the regression suite -- every stage of my-scan
+                            against temp dirs and a stub my-ocr, then my-ocr's
+                            own suite. Starts no scan and no OCR.
+
+SCAN OPTIONS:
+  -w|--wait                 Wait for a document in the feeder
+  -d|--duplex               Expect a DUPLEX document in the feeder (implies -w)
+  -r|--resolution <DPI>     75 | 100 | 200 | 300 | 600
+  -g|--grey|--gray          Scan greyscale instead of colour
+
+
+SETTLE:
+  Every delivery is settled by 'process' before it is touched: no
+  SMB/FTP writer holds it, its size has stopped changing, and it parses.
+  'status -V' reports which of the three a still-waiting file is failing.
+  --settle-timeout <SEC>    Override SETTLE_TIMEOUT for this run
+
+CONFIG:
+  Searched in this order, first existing wins:
+    \$MY_SCAN_CONFIG, --config <FILE>, /LINKS/default/my-scan,
+    ~/.my-scan.conf, /etc/my-scan.conf, /usr/local/etc/my-scan.conf
+
+EXAMPLES:
+  $US                                     print this usage
+  $US scan                                scan the feeder, else the flatbed
+  $US --duplex bank-statement.pdf         duplex scan to a named file
+  $US setup                               dry-run the Folder Action install
+  $US setup go                            apply it
+  $US uninstall                           dry-run removing the wiring
+  $US uninstall go                        remove it (documents stay untouched)
+  $US -V status                           ...and why a delivery is not moving
+  $US status --watch                      live: one line per change, until drained
+  $US status --watch 0.5                  ...polling twice a second
+  echo /path/to/scan.pdf | $US process     (what the Folder Action runs)
+  $US process                             list what is pending, change nothing
+  $US process --all                       process the whole backlog
+  $US process --retry                     list what is stranded in the OCR queue
+  $US process --retry --all               hand it back to my-ocr
+  $US process --retry failed --all        ...and the ones my-ocr could not do
+  ls -1d <dir>/* | head -10 | $US process process just those ten
+_EOU_
+  exit 0
+}
+
+
+##############################################################################
+#### MAIN
+
+ARGS=""
+while [ $# -gt 0 ]; do
+  _a="$1"; shift
+  case "$_a" in
+    -h|--help|help)      usage ;;
+    --version)           do_version; exit 0 ;;
+    -Q|--quiet)          QUIET=1 ;;
+    -V|--verbose)        VRB=1 ;;
+    -D|--debug)          DBG=1; case "$1" in ""|-*) ;; *) DBG_LOGFILE="$1"; shift ;; esac ;;
+    -DD|--deepdebug)     DEEPDBG=1; case "$1" in ""|-*) ;; *) DBG_LOGFILE="$1"; shift ;; esac ;;
+    -L|--no-log)         NO_LOG=1 ;;
+    --run-tests)         RUN_TESTS=1 ;;
+    --watch)             WATCH=1; case "$1" in ""|-*) ;; *) WATCH_INTERVAL_OVERRIDE="$1"; shift ;; esac ;;
+    --watch=*)           WATCH=1; WATCH_INTERVAL_OVERRIDE="${_a#--watch=}" ;;
+    --dry-run)           DRY_RUN=1 ;;
+    --config)            CONFIG="$1"; shift ;;
+    --config=*)          CONFIG="${_a#--config=}" ;;
+    --create-config)     CREATE_CONFIG=1; case "$1" in ""|-*) ;; *) CREATE_CONFIG_FILE="$1"; shift ;; esac ;;
+    --create-config=*)   CREATE_CONFIG=1; CREATE_CONFIG_FILE="${_a#--create-config=}" ;;
+    --settle-timeout)    SETTLE_TIMEOUT_OVERRIDE="$1"; shift ;;
+    -w|--wait)           WAIT_FOR_ADF=1 ;;
+    -d|--duplex)         WAIT_FOR_ADF=1; DUPLEX=1 ;;
+    -g|--grey|--gray)    SCAN_MODE_OVERRIDE="Gray" ;;
+    -r|--resolution)     isInt "$1" || err 074 "--resolution needs an integer, got '$1'."
+                         SCAN_DPI_OVERRIDE="$1"; shift ;;
+    --all)               CANCEL_ALL=1; RESET_ALL=1; PROCESS_ALL=1 ;;
+    --retry)             PROCESS_RETRY="queue"
+                         case "$1" in failed|all) PROCESS_RETRY="$1"; shift ;; esac ;;
+    --yes)               ASSUME_YES=1 ;;
+    -S|--status)         WHAT="status" ;;
+    scan|process|setup|install|uninstall|status|cancel|reset|devices|stamp-version)
+                         # the first such bare word is the subcommand; a later
+                         # one is an ordinary argument (a file may be named "scan")
+                         if [ -z "$WHAT" ]; then WHAT="$_a"; else ARGS="$ARGS${NL}$_a"; fi ;;
+    *)                   ARGS="$ARGS${NL}$_a" ;;
+  esac
+done
+
+# implication chain -- enforced once, right here
+[ "$DEEPDBG" = "1" ] && DBG=1
+[ "$DBG" = "1" ] && VRB=1
+[ "$VRB" = "1" ] && QUIET=0
+[ "$DEEPDBG" = "1" ] && { PS4='+ '; set -x; }
+
+# --create-config needs no config file
+[ -n "$CREATE_CONFIG" ] && { do_create_config; exit 0; }
+
+# stamp-version edits this file and needs no config either
+[ "$WHAT" = "stamp-version" ] && { do_stamp_version; exit 0; }
+# --run-tests builds its own worlds and configs, so it needs no config of its own
+[ -n "$RUN_TESTS" ] && { do_run_tests; exit $?; }
+
+load_config
+
+# argv overrides config
+[ -n "$SCAN_MODE_OVERRIDE" ]     && SCAN_MODE="$SCAN_MODE_OVERRIDE"
+[ -n "$SCAN_DPI_OVERRIDE" ]      && SCAN_DPI="$SCAN_DPI_OVERRIDE"
+[ -n "$SETTLE_TIMEOUT_OVERRIDE" ] && SETTLE_TIMEOUT="$SETTLE_TIMEOUT_OVERRIDE"
+# Only a value the USER typed is an error worth stopping for. A config file
+# written before WATCH_INTERVAL existed simply has no such key -- that must not
+# break every invocation of a tool whose main job has nothing to do with it.
+if [ -n "$WATCH_INTERVAL_OVERRIDE" ]; then
+  isNum "$WATCH_INTERVAL_OVERRIDE" \
+    || err 079 "--watch interval '$WATCH_INTERVAL_OVERRIDE' is not a positive number."
+  WATCH_INTERVAL="$WATCH_INTERVAL_OVERRIDE"
+fi
+
+NOW="$(date +"%Y-%m-%d_%H%M.%S")"
+
+# positional arguments
+set --
+while IFS= read -r _a; do
+  [ -z "$_a" ] && continue
+  set -- "$@" "$_a"
+done <<_EOARGS_
+$ARGS
+_EOARGS_
+
+
+RC=0
+# shellcheck disable=SC2317  # do_process/do_watch exit; the others return here
+# A bare 'my-scan' prints the usage. It is what you type when you are not sure
+# what the tool does, and 'scan' -- the one subcommand that drives hardware --
+# is the wrong thing to start from a stray Enter.
+case "${WHAT:-usage}" in
+  usage)    usage ;;
+  scan)     do_scan "$@";     RC=$? ;;
+  process)  do_process;      RC=$? ;;
+  setup|install)  do_setup "$@";    RC=$? ;;
+  uninstall)      do_uninstall "$@"; RC=$? ;;
+  status)   if [ -n "$WATCH" ]; then do_watch_status; else do_status ""; fi; RC=$? ;;
+  cancel)   do_cancel "$@";  RC=$? ;;
+  reset)    do_reset;        RC=$? ;;
+  devices)  do_devices;       RC=$? ;;
+  *)        err 075 "Unknown subcommand '$WHAT'. See --help." ;;
+esac
+
+# the subcommand's verdict is the tool's exit status -- a caller that pipes
+# 'settle' into something else must be able to see that it failed
+exit $RC
