@@ -414,6 +414,8 @@ _EOCONF_
 }
 
 config_search_list() {
+  # both spellings are accepted under /LINKS/default: .conf first, then bare
+  _p "/LINKS/default/my-scan.conf"
   _p "/LINKS/default/my-scan"
   _p "$HOME/.my-scan.conf"
   _p "/etc/my-scan.conf"
