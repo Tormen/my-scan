@@ -4,6 +4,12 @@ Receives what the scanner pushes, waits until the delivery is actually
 complete, hands the OCR to `my-ocr`, and files the result. It can also
 pull-scan a device directly.
 
+**Especially useful together with [my-ocr](../my-ocr/) and ABBYY FineReader Pro
+for Mac 12.1.14** (`/Applications/FineReader.app`, bundle
+`com.abbyy.FineReaderPro`): that FineReader has no command line, my-ocr gives it
+one and serialises it, and my-scan puts a scanner in front of it. The three
+together are an unattended scan-to-searchable-PDF pipeline.
+
 ```
 usage: my-scan [OPTIONAL] <MANDATORY> parameters.
 
