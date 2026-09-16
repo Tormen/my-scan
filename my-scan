@@ -11,7 +11,7 @@
 # 088 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="bf1de8a"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="44ac2de"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 
 US="${0##*/}"
 
@@ -311,6 +311,11 @@ DROP_LABELS="ftp"
 SETTLE_TIMEOUT=600                 # seconds, whole settle for one file
 SETTLE_POLL=1                      # seconds between polls
 SETTLE_STABLE_POLLS=3              # consecutive equal sizes required
+# Stop waiting on a delivery that nobody is writing, whose size is steady and
+# which still does not parse -- it is damaged, and the full SETTLE_TIMEOUT
+# teaches nothing. 0 disables it (wait the whole timeout, the old behaviour).
+# Only ever applied when lsof actually answered; see SETTLE_LSOF_SEARCH.
+SETTLE_UNPARSEABLE_GIVEUP=30       # seconds
 # Processes whose write handle means "still being delivered" (SMB *and* FTP):
 SETTLE_WRITER_PROCS="smbd pure-ftpd pureftpd vsftpd ftpd proftpd"
 SETTLE_LSOF_TIMEOUT=10             # seconds; lsof itself has no timeout
@@ -414,7 +419,10 @@ c_lsof="/usr/sbin/lsof"
 # qpdf validates every object and stream; pdfinfo reads only the trailer,
 # catalog and page tree. A delivery whose CONTENT is damaged passes pdfinfo
 # and fails qpdf -- and OCRing it would waste a run and poison the queue.
-c_qpdf="/opt/homebrew/bin/qpdf"
+# Empty is fine: my-scan then looks in QPDF_SEARCH and $PATH, the way it does
+# for lsof. A wrong path here is named, never silently ignored.
+c_qpdf=""
+QPDF_SEARCH="/opt/homebrew/bin/qpdf /usr/local/bin/qpdf /usr/bin/qpdf"
 # -b -w: no blocking kernel calls, no warnings.  -n -P: no host/port lookups.
 # Without these lsof can hang for minutes on an unresponsive mount.
 c_lsof_opts="-b -w -n -P"
@@ -483,7 +491,12 @@ validate_config() {
     elif ! isInt "$_v"; then _missing="$_missing $_k=\"$_v\"(not a number)"; fi
   done
   # SCAN_DEVICE_USUALLY_OFF is deliberately allowed to be empty (= "no")
-  for _k in OCR_QUEUE_PATH T_PATH_DONE T_PATH_FAILED SETTLE_WRITER_PROCS MY_OCR; do
+  # IGNORE_FILENAME_PATTERNS is REQUIRED, not optional: unset, is_ignored_name
+  # matches nothing, and every dotfile the FTP server drops (.ftpquota) counts
+  # as a document waiting to be OCRed. A silently wrong count is worse than a
+  # refusal to start, because it is believed.
+  for _k in OCR_QUEUE_PATH T_PATH_DONE T_PATH_FAILED SETTLE_WRITER_PROCS MY_OCR \
+           IGNORE_FILENAME_PATTERNS; do
     # c_lsof is deliberately NOT required: empty means "autodetect", which is
     # how it works across OSes.
     eval "_v=\$$_k"
@@ -620,6 +633,7 @@ weaker. Install lsof, or set c_lsof in the config." "-"
 
 # shellcheck disable=SC2154  # set by the sourced config file
 settle_writer_busy() { # $1 = file. 0 = a writer still holds it.
+  SETTLE_WRITER_CHECKED=0
   find_lsof || return 1
 
   # lsof can block for minutes on an unresponsive mount, and it has no timeout
@@ -643,6 +657,7 @@ settle_writer_busy() { # $1 = file. 0 = a writer still holds it.
     rm -f "$_lsof_out"
     # never silently: an unusable writer check means the size-stability and
     # parse checks are carrying this file on their own
+    SETTLE_WRITER_CHECKED=0
     err 076 "lsof did not answer within ${SETTLE_LSOF_TIMEOUT}s for '$1' -- \
 skipping the writer check, relying on size-stability and parse" "-"
     return 1
@@ -656,6 +671,7 @@ skipping the writer check, relying on size-stability and parse" "-"
         for (i = 1; i <= n; i++) if ($1 == p[i]) { print; next } }' "$_lsof_out")"
   rm -f "$_lsof_out"
 
+  SETTLE_WRITER_CHECKED=1
   [ -n "$_busy" ] || return 1
   ddbg "settle: writer still holds '$1':"
   [ "$DEEPDBG" = "1" ] && indent "$_busy" "   ~ | " 1>&2
@@ -716,8 +732,9 @@ settle_check() {
 # WAIT until settled. Used by process, which must not touch a delivery
 # that is still arriving.
 settle_file() { # $1 = file. 0 = settled, 1 = timed out.
-  _f="$1"; _i=0; _stable=0; _last=""
-  dbg "settle_file('$_f'): timeout=${SETTLE_TIMEOUT}s poll=${SETTLE_POLL}s stable=${SETTLE_STABLE_POLLS}"
+  _f="$1"; _i=0; _stable=0; _last=""; _unparse=0; _said=-1
+  _giveup="$SETTLE_UNPARSEABLE_GIVEUP"; isInt "$_giveup" || _giveup=0
+  dbg "settle_file('$_f'): timeout=${SETTLE_TIMEOUT}s poll=${SETTLE_POLL}s stable=${SETTLE_STABLE_POLLS} giveup=${_giveup}s"
   vdet "waiting until no SMB/FTP writer holds it, its size stops changing, and it parses"
 
   while [ "$_i" -lt "$SETTLE_TIMEOUT" ]; do
@@ -731,9 +748,31 @@ settle_file() { # $1 = file. 0 = settled, 1 = timed out.
     else
       _stable=0
       [ "$SETTLE_REASON" = "vanished" ] && return 1
+      # Nobody is writing it, its size has stopped moving, and it still does
+      # not parse: that is damaged, not "still arriving". Waiting out the full
+      # timeout costs 10 minutes per corrupt delivery and learns nothing. Only
+      # when the writer check actually ran -- without lsof we cannot claim
+      # nobody is writing, and a slow transfer would be failed as broken.
+      case "$SETTLE_REASON" in
+        "size steady but it does not parse yet")
+          _unparse=$(( _unparse + SETTLE_POLL ))
+          if [ "$_giveup" -gt 0 ] && [ "$SETTLE_WRITER_CHECKED" = "1" ] \
+             && [ "$_unparse" -ge "$_giveup" ]; then
+            SETTLE_REASON="no writer holds it and its size is steady, but it does not parse -- damaged, not still arriving"
+            err 018 "GAVE UP after ${_unparse}s on '$_f' -- $SETTLE_REASON" "-"
+            return 1
+          fi ;;
+        *) _unparse=0 ;;
+      esac
     fi
     _last="$SETTLE_SIZE"
     ddbg "settle [$_i/$SETTLE_TIMEOUT] '$_f': $SETTLE_REASON"
+    # A long wait must show life at -V. Without this, a 600s settle is
+    # indistinguishable from a hang -- the per-poll line is -DD only.
+    if [ "$_i" -gt 0 ] && [ "$_said" != "$_i" ] && [ $(( _i % 30 )) -lt "$SETTLE_POLL" ]; then
+      _said="$_i"
+      vdet "still waiting (${_i}s of ${SETTLE_TIMEOUT}s): $SETTLE_REASON"
+    fi
     sleep "$SETTLE_POLL"
     _i=$(( _i + SETTLE_POLL ))
   done
@@ -777,6 +816,7 @@ _EOSR2_
 
 settle_backup() { # $1 = file
   [ -n "$SETTLE_BACKUP_PATH" ] || return 0
+  [ -n "$DRY_RUN" ] && { vdet "WOULD back up the raw delivery to '$SETTLE_BACKUP_PATH/'"; return 0; }
   _bkp="$SETTLE_BACKUP_PATH/$(date +"%Y-%m-%d_%H%M.%S")___$$"
   mkdir -p "$_bkp" || { err 016 "FAILED to create backup dir '$_bkp'" "-"; return 1; }
   run rsync -axSH "$1" "$_bkp/" || { err 017 "FAILED to back up '$1' to '$_bkp/'" "-"; return 1; }
@@ -851,6 +891,12 @@ determine_T_INP() { # sets T_INP from $INP / $S_INP / $T_PATH
 # shellcheck disable=SC2154  # set by the sourced config file
 stage_file() {
   determine_T_INP || return 1
+  # ONE choke point: every path that files a document goes through here, so
+  # guarding it here is what makes --dry-run true for all of them.
+  if [ -n "$DRY_RUN" ]; then
+    pe "  >  WOULD stage '$S_INP' -> '$T_INP'"
+    return 0
+  fi
   cp "$S_INP" "$T_INP"  || { pe " >>> FAILED [$?] to cp '$S_INP' '$T_INP'";  return 1; }
   "$c_trash" "$S_INP"   || { pe " >>> FAILED [$?] to trash '$S_INP'";        return 1; }
   chmod 660 "$T_INP" 2>/dev/null
@@ -958,6 +1004,31 @@ page_count() { # $1 = file
   printf '%s\n' "$_pc"
 }
 
+# Same shape as find_lsof: a configured path wins, then the usual places, then
+# $PATH. A config written before c_qpdf existed must not silently disable the
+# gate -- that is how the check shipped inert on a host that HAD qpdf.
+find_qpdf() {
+  { [ -n "$c_qpdf" ] && [ -x "$c_qpdf" ]; } && return 0
+  if [ -n "$c_qpdf" ] && [ -z "$QPDF_WARNED" ]; then
+    QPDF_WARNED=1
+    err 020 "c_qpdf '$c_qpdf' is not executable -- searching the usual places instead." "-"
+  fi
+  for _c in $QPDF_SEARCH /opt/homebrew/bin/qpdf /usr/local/bin/qpdf /usr/bin/qpdf; do
+    [ -x "$_c" ] && c_qpdf="$_c" && return 0
+  done
+  c_qpdf="$(command -v qpdf 2>/dev/null)"
+  { [ -n "$c_qpdf" ] && [ -x "$c_qpdf" ]; } && return 0
+  if [ -z "$QPDF_WARNED" ]; then
+    QPDF_WARNED=1
+    # LOUD, not a -V detail: a gate you believe is running but is not is worse
+    # than no gate, because it buys confidence that nothing is backing.
+    err 024 "qpdf not found -- the deep structural check is DISABLED.
+A delivery whose CONTENT was damaged in transit will pass settle and be OCRed.
+Install qpdf (brew install qpdf), or set c_qpdf in the config." "-"
+  fi
+  return 1
+}
+
 # The deep structural check, run once per delivery after it has settled.
 # qpdf grades its exit: 0 = clean, 3 = warnings only, 2 = real damage. Reading
 # any non-zero as damage would quarantine healthy documents over cosmetic
@@ -968,9 +1039,8 @@ deep_check_ok() { # $1 = file. 0 = usable, 1 = damaged
     PDF) ;;
     *) return 0 ;;                       # pictures have no structure to check
   esac
-  if [ -z "$c_qpdf" ] || [ ! -x "$c_qpdf" ]; then
+  if ! find_qpdf; then
     DEEP_CHECK_WHY=""
-    vdet "no qpdf -- skipping the deep structural check"
     return 0
   fi
   "$c_qpdf" --check "$1" >/dev/null 2>&1
@@ -984,10 +1054,18 @@ deep_check_ok() { # $1 = file. 0 = usable, 1 = damaged
 # Is this name one we never treat as a document?
 is_ignored_name() { # $1 = path
   _in_b="${1##*/}"
+  # These are globs to MATCH WITH, not globs to EXPAND. Unquoted in a for-loop
+  # the shell expands them against the current directory first, so ".*" became
+  # the dotfiles of whatever directory we happened to be standing in and a real
+  # ".ftpquota" matched nothing. Disable pathname expansion for the loop, and
+  # put it back exactly as it was.
+  case $- in *f*) _in_noglob=1 ;; *) _in_noglob=0; set -f ;; esac
   for _in_p in $IGNORE_FILENAME_PATTERNS; do
     # shellcheck disable=SC2254  # config-supplied globs, deliberately unquoted
-    case "$_in_b" in $_in_p) return 0 ;; esac
+    # shellcheck disable=SC2254  # config-supplied glob, deliberately unquoted
+    case "$_in_b" in $_in_p) [ "$_in_noglob" = "0" ] && set +f; return 0 ;; esac
   done
+  [ "$_in_noglob" = "0" ] && set +f
   return 1
 }
 
@@ -1410,10 +1488,12 @@ do_process() {
 
     # 3. A marked file is filed as it is: we simply do not call my-ocr for it.
     _no_ocr=""
+    case $- in *f*) _no_noglob=1 ;; *) _no_noglob=0; set -f ;; esac
     for _pat in $NO_OCR_PATTERNS; do
       # shellcheck disable=SC2254  # a config-supplied glob, deliberately
       case "$INP" in $_pat) _no_ocr=1;; esac
     done
+    [ "$_no_noglob" = "0" ] && set +f
     if [ -n "$_no_ocr" ]; then
       IGNORED_CNT=$(( IGNORED_CNT + 1 ))
       T_PATH="$T_PATH_DONE"; stage_file
@@ -1438,11 +1518,16 @@ _EOPI_
   if [ -n "$_staged" ]; then
     _n="$(printf '%s\n' "$_staged" | wc -l | tr -d ' ')"
     pe ""
-    pe " >>> Handing $_n file(s) to $MY_OCR"
-    pe "     It blocks until it is our turn -- one FineReader run exists at a"
-    pe "     time, and my-ocr is what guarantees that."
-    pe "     Anything it cannot OCR goes to '$T_PATH_FAILED' (--move-failed-to)."
-    ocr_in_chunks "$_staged"
+    if [ -n "$DRY_RUN" ]; then
+      pe " >>> WOULD hand $_n file(s) to $MY_OCR"
+      pe "     Nothing was moved, staged or OCRed -- this was a --dry-run."
+    else
+      pe " >>> Handing $_n file(s) to $MY_OCR"
+      pe "     It blocks until it is our turn -- one FineReader run exists at a"
+      pe "     time, and my-ocr is what guarantees that."
+      pe "     Anything it cannot OCR goes to '$T_PATH_FAILED' (--move-failed-to)."
+      ocr_in_chunks "$_staged"
+    fi
   fi
 
   pe ""
@@ -3337,6 +3422,158 @@ t_my_ocr_suite() {
   fi
 }
 
+# The test that would have caught it: --dry-run was parsed, documented as
+# "change nothing", and honoured by setup/uninstall/reset/cleanup only. The
+# process path ignored it, so a "preview" moved the delivery, staged it, ran a
+# real OCR and quarantined the document.
+t_dry_run() {
+  _d="$T_TMP/dryrun"; t_world "$_d"
+  t_pdf "$_d/drop/preview.pdf"
+  _o="$("$0" --config "$T_CONF" --dry-run process --all 2>&1 </dev/null)"
+
+  if [ -f "$_d/drop/preview.pdf" ]; then
+    t_ok "--dry-run: the delivery stays in the drop folder"
+  else
+    t_bad "--dry-run: the delivery stays in the drop folder" "it was moved -- the preview changed the world"
+  fi
+  if [ -z "$(find "$_d/2ocr" "$_d/done" "$_d/failed" -type f 2>/dev/null)" ]; then
+    t_ok "--dry-run: nothing is staged, filed or quarantined"
+  else
+    t_bad "--dry-run: nothing is staged, filed or quarantined" \
+          "$(find "$_d/2ocr" "$_d/done" "$_d/failed" -type f 2>/dev/null | tr '\n' ' ')"
+  fi
+  if [ -f "$_d/ocr.called" ]; then
+    t_bad "--dry-run: my-ocr is never called" "a real OCR ran during a dry run"
+  else
+    t_ok "--dry-run: my-ocr is never called"
+  fi
+  case "$_o" in
+    *WOULD*) t_ok "--dry-run: it says what it WOULD do";;
+    *)       t_bad "--dry-run: it says what it WOULD do" "no WOULD line in the output";;
+  esac
+
+  # REVERT-AND-VERIFY. Without this the four checks above also pass when
+  # 'process' is broken and does nothing at all -- they would certify the bug.
+  "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null
+  if [ ! -f "$_d/drop/preview.pdf" ] && [ -f "$_d/ocr.called" ]; then
+    t_ok "--dry-run: the same run WITHOUT it does move and OCR (so the test is not vacuous)"
+  else
+    t_bad "--dry-run: the same run WITHOUT it does move and OCR (so the test is not vacuous)" \
+          "a real run did nothing either -- the dry-run checks prove nothing"
+  fi
+}
+
+# A config written before a key existed must not silently change behaviour.
+# IGNORE_FILENAME_PATTERNS unset means is_ignored_name matches nothing, and
+# every dotfile the FTP server drops counts as a document waiting to be OCRed.
+t_config_keys() {
+  _d="$T_TMP/cfgkeys"; t_world "$_d"
+  grep -v '^IGNORE_FILENAME_PATTERNS=' "$T_CONF" >"$_d/conf.old"
+  _o="$("$0" --config "$_d/conf.old" status 2>&1 </dev/null)"
+  case "$_o" in
+    *IGNORE_FILENAME_PATTERNS*)
+      t_ok "a config missing IGNORE_FILENAME_PATTERNS is refused, and the key is named";;
+    *) t_bad "a config missing IGNORE_FILENAME_PATTERNS is refused, and the key is named" \
+             "$(printf '%s' "$_o" | tail -n 1)";;
+  esac
+
+  : >"$_d/drop/.ftpquota"
+  t_pdf "$_d/drop/real.pdf"
+  _o="$("$0" --config "$T_CONF" status 2>&1 </dev/null)"
+  case "$_o" in
+    *"1 waiting"*) t_ok "status counts documents, not the FTP server's .ftpquota";;
+    *) t_bad "status counts documents, not the FTP server's .ftpquota" \
+             "$(printf '%s' "$_o" | grep DROP | tail -n 1)";;
+  esac
+}
+
+# The gate shipped INERT on a host that had qpdf, because the config predated
+# c_qpdf and an unset path was read as "skip the check".
+t_qpdf_autodetect() {
+  if ! command -v qpdf >/dev/null 2>&1 && [ ! -x /usr/local/bin/qpdf ] \
+     && [ ! -x /opt/homebrew/bin/qpdf ]; then
+    t_ok "qpdf autodetect: skipped, no qpdf on this host"; return 0
+  fi
+  _d="$T_TMP/qpdfauto"; t_world "$_d"
+  sed -e 's|^c_qpdf=.*|c_qpdf=""|' "$T_CONF" >"$_d/conf.noqpdf"
+  t_pdf "$_d/whole.pdf"
+  _sz="$(wc -c <"$_d/whole.pdf" | tr -d ' ')"
+  dd if="$_d/whole.pdf" of="$_d/drop/damaged.pdf" bs=1 count=$(( _sz - 40 )) 2>/dev/null
+  printf 'trailer
+<< /Size 5 /Root 1 0 R >>
+startxref
+9
+%%%%EOF
+' >>"$_d/drop/damaged.pdf"
+  "$0" --config "$_d/conf.noqpdf" --settle-timeout 6 process --all >/dev/null 2>&1 </dev/null
+  if [ -n "$(find "$_d/failed" -name '*damaged*' 2>/dev/null)" ]; then
+    t_ok "qpdf is found even with c_qpdf unset -- the deep check still runs"
+  else
+    t_bad "qpdf is found even with c_qpdf unset -- the deep check still runs" \
+          "a structurally damaged delivery passed: the gate was silently skipped"
+  fi
+}
+
+# A file nobody is writing, whose size is steady and which does not parse, is
+# damaged. Waiting the full SETTLE_TIMEOUT for it costs 10 minutes per corrupt
+# delivery -- two of them in the backlog cost 20 minutes of doing nothing.
+t_settle_giveup() {
+  if ! command -v lsof >/dev/null 2>&1 && [ ! -x /usr/sbin/lsof ]; then
+    t_ok "settle give-up: skipped, no lsof (the rule needs the writer check)"; return 0
+  fi
+  _d="$T_TMP/giveup"; t_world "$_d"
+  sed -e 's|^SETTLE_TIMEOUT=.*|SETTLE_TIMEOUT=60|' \
+      -e 's|^SETTLE_UNPARSEABLE_GIVEUP=.*|SETTLE_UNPARSEABLE_GIVEUP=3|' "$T_CONF" >"$_d/conf.giveup"
+  # must be PDF to 'file' (so settle runs pdfinfo on it) and unreadable to
+  # pdfinfo (so it never parses) -- that pair is what the give-up rule is for
+  printf '%%PDF-1.4\ngarbage that is not a real pdf body\n' >"$_d/drop/corrupt.pdf"
+  _t0="$(date +%s)"
+  _o="$("$0" --config "$_d/conf.giveup" process --all 2>&1 </dev/null)"
+  _el=$(( $(date +%s) - _t0 ))
+  if [ "$_el" -lt 40 ]; then
+    t_ok "settle: a stable unparseable delivery is given up on (${_el}s, not the full 60s)"
+  else
+    t_bad "settle: a stable unparseable delivery is given up on" \
+          "took ${_el}s -- it waited out the whole timeout"
+  fi
+  case "$_o" in
+    *"GAVE UP"*|*"not still arriving"*)
+      t_ok "settle: it says the delivery is damaged, not still arriving";;
+    *) t_bad "settle: it says the delivery is damaged, not still arriving" \
+             "$(printf '%s' "$_o" | tail -n 1)";;
+  esac
+}
+
+# Documentation is not executed, so it rots silently. my-ocr has had this
+# check for a while; my-scan did not, which is how a --dry-run documented as
+# "change nothing" could go on staging, moving and OCRing for as long as it did.
+t_help_claims() {
+  _h="$("$0" --help 2>&1)"
+  for _o in -h --help -Q --quiet -V --verbose -D --debug -DD --deepdebug \
+            -L --no-log --watch --config --create-config --dry-run --version \
+            --run-tests --test-mail -w --wait -d --duplex -r --resolution \
+            --grey --settle-timeout; do
+    case "$_h" in *"$_o"*) ;; *) continue;; esac
+    if grep -q -- "$_o)" "$0" || grep -q -- "$_o|" "$0"; then :; else
+      t_bad "every option --help lists is handled by the parser" \
+            "'$_o' is documented but unhandled"; return
+    fi
+  done
+  t_ok "every option --help lists is handled by the parser"
+
+  # A config key named in --help is a claim too: it must exist in the default
+  # config AND be read by the code, or the sentence describes nothing.
+  for _k in SETTLE_UNPARSEABLE_GIVEUP SETTLE_TIMEOUT; do
+    case "$_h" in *"$_k"*) ;; *) continue;; esac
+    if "$0" --create-config 2>/dev/null | grep -q "^$_k=" \
+       && grep -qF -- "\$$_k" "$0"; then :; else
+      t_bad "a config key --help names exists and is read" \
+            "'$_k' is documented but not in the default config, or never read"; return
+    fi
+  done
+  t_ok "every config key --help names exists in the default config and is read"
+}
+
 do_run_tests() {
   _p "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-scan.tests.XXXXXX)" || { _p "mktemp failed"; return 1; }
@@ -3358,6 +3595,11 @@ do_run_tests() {
   t_listing_not_swallowed_by_log
   t_reset_delegates
   t_test_mail
+  t_help_claims
+  t_dry_run
+  t_config_keys
+  t_qpdf_autodetect
+  t_settle_giveup
   t_my_ocr_suite
   rm -rf "$T_TMP"
   _p "  ----"
@@ -3458,6 +3700,9 @@ SETTLE:
   Every delivery is settled by 'process' before it is touched: no
   SMB/FTP writer holds it, its size has stopped changing, and it parses.
   'status -V' reports which of the three a still-waiting file is failing.
+  A delivery no writer holds, whose size is steady and which still does not
+  parse, is damaged rather than late: it is given up on after
+  SETTLE_UNPARSEABLE_GIVEUP seconds instead of waiting out the whole timeout.
   --settle-timeout <SEC>    Override SETTLE_TIMEOUT for this run
 
 CONFIG:
@@ -3480,6 +3725,7 @@ EXAMPLES:
   echo /path/to/scan.pdf | $US process     (what the Folder Action runs)
   $US process                             list what is pending, change nothing
   $US process --all                       process the whole backlog
+  $US --dry-run process --all             ...preview it: moves nothing, OCRs nothing
   $US process --retry                     list what is stranded in the OCR queue
   $US process --retry --all               hand it back to my-ocr
   $US process --retry failed --all        ...and the ones my-ocr could not do
@@ -3560,7 +3806,7 @@ load_config
 # break every invocation of a tool whose main job has nothing to do with it.
 if [ -n "$WATCH_INTERVAL_OVERRIDE" ]; then
   isNum "$WATCH_INTERVAL_OVERRIDE" \
-    || err 079 "--watch interval '$WATCH_INTERVAL_OVERRIDE' is not a positive number."
+    || err 019 "--watch interval '$WATCH_INTERVAL_OVERRIDE' is not a positive number."
   WATCH_INTERVAL="$WATCH_INTERVAL_OVERRIDE"
 fi
 
