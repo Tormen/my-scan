@@ -206,7 +206,10 @@ A scan is checked on the way IN and the result is checked on the way OUT,
 because in between the original is destroyed: my-ocr replaces it in place and
 moves it to the Trash a moment earlier.
 
-**On the way in**, once per delivery after it settles: `qpdf --check`. settle's
+**On the way in**, once per delivery after it settles: `qpdf --check`. qpdf is
+located the way lsof is -- `c_qpdf`, then `QPDF_SEARCH`, then `$PATH` -- and if
+it cannot be found at all you are told loudly, because a gate you believe is
+running but is not is worse than no gate. settle's
 own parse test only proves `pdfinfo` can read the catalogue; a file whose page
 CONTENT was damaged in transit passes that and fails this. qpdf's exit is
 graded and read as such -- 0 clean, 3 warnings only, 2 damage -- because
@@ -317,7 +320,7 @@ The warning names the script and how to detach it.
 | `-L`, `--no-log` | do not write to the configured logfile |
 | `--config <FILE>` | use this config, bypassing the search |
 | `--create-config [<FILE>]` | print the default config, or write it to FILE |
-| `--dry-run` | show what would change; change nothing |
+| `--dry-run` | show what would change; change nothing — including `process`, which then moves, stages and OCRs nothing |
 | `--all` / `--yes` | `cancel`/`reset`: act on everything / skip the prompt |
 | `--version` | version, commit and build id |
 | `--test-mail` | send one test mail the way the alerts go (`NOTIFY_VIA`, `NOTIFY_MAIL_TO`/`_FROM`); fails when mail is off or my-notify fails |
