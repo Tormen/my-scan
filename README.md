@@ -320,6 +320,7 @@ The warning names the script and how to detach it.
 | `--dry-run` | show what would change; change nothing |
 | `--all` / `--yes` | `cancel`/`reset`: act on everything / skip the prompt |
 | `--version` | version, commit and build id |
+| `--test-mail` | send one test mail the way the alerts go (`NOTIFY_VIA`, `NOTIFY_MAIL_TO`/`_FROM`); fails when mail is off or my-notify fails |
 
 Scan options: `-w/--wait`, `-d/--duplex`, `-r/--resolution <DPI>`, `-g/--grey`.
 Settle: `--settle-timeout <SEC>`.
