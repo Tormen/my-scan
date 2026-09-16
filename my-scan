@@ -8,10 +8,10 @@
 #   my-scan-processor-macos                 -> 'process' (OCR now goes to my-ocr)
 #   my-scan-processor-macos___wait-for-ocr  -> 'watch'   (OCR deblock watchdog)
 #
-# 081 == highest used errCode
+# 088 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="c51d516"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="bf1de8a"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 
 US="${0##*/}"
 
@@ -38,6 +38,7 @@ DBG=
 DEEPDBG=
 DBG_LOGFILE=
 
+TEST_MAIL=               # --test-mail
 CONFIG=                  # --config <FILE>
 CREATE_CONFIG=           # --create-config [<FILE>]
 CREATE_CONFIG_FILE=
@@ -218,16 +219,24 @@ notify_user() { # $1 = subject, $2 = body (optional)
   esac
   case ",$NOTIFY_VIA," in
     *,mail,*)
-      if   [ -n "$NOTIFY_MAIL_FROM" ] && [ -n "$NOTIFY_MAIL_TO" ]; then
-        "$my_notify" --mail "$NOTIFY_MAIL_FROM" "$NOTIFY_MAIL_TO" "$_nu_s" "${2:-}" >/dev/null 2>&1
-      elif [ -n "$NOTIFY_MAIL_TO" ]; then
-        "$my_notify" --mail "$NOTIFY_MAIL_TO" "$_nu_s" "${2:-}" >/dev/null 2>&1
-      else
-        "$my_notify" --mail "$_nu_s" "${2:-}" >/dev/null 2>&1
-      fi
-      [ "$?" -eq 0 ] || pe " >>> WARNING: could not send the mail (my-notify alerts itself)" ;;
+      notify_mail "$1" "${2:-}" >/dev/null 2>&1 \
+        || pe " >>> WARNING: could not send the mail (my-notify alerts itself)" ;;
   esac
   return 0
+}
+
+# The mail half of notify_user, on its own so that 'my-scan --test-mail' sends
+# through this very call. Returns my-notify's exit status; what becomes of its
+# output is the caller's choice.
+notify_mail() { # $1 = subject (the marker is added here), $2 = body (optional)
+  _nm_s="${NOTIFY_SUBJECT_MARKER:+$NOTIFY_SUBJECT_MARKER }$1"
+  if   [ -n "$NOTIFY_MAIL_FROM" ] && [ -n "$NOTIFY_MAIL_TO" ]; then
+    run "$my_notify" --mail "$NOTIFY_MAIL_FROM" "$NOTIFY_MAIL_TO" "$_nm_s" "${2:-}"
+  elif [ -n "$NOTIFY_MAIL_TO" ]; then
+    run "$my_notify" --mail "$NOTIFY_MAIL_TO" "$_nm_s" "${2:-}"
+  else
+    run "$my_notify" --mail "$_nm_s" "${2:-}"
+  fi
 }
 
 # A delivery that never arrived intact. Says WHAT is wrong and WHAT TO DO,
@@ -2698,6 +2707,16 @@ done
 exit $_rc
 _EOSTUB_
   chmod +x "$_tw/my-ocr.stub"
+  # stub my-notify: the suite must never pop a notification or send a real
+  # mail. Records each call's arguments, one per line, and a '---' after them;
+  # exits with the number in notify.rc (default 0).
+  cat >"$_tw/my-notify.stub" <<'_EOSTUB_'
+#!/bin/dash
+_d="$(dirname "$0")"
+printf '%s\n' "$@" --- >>"$_d/notify.args"
+exit "$(cat "$_d/notify.rc" 2>/dev/null || echo 0)"
+_EOSTUB_
+  chmod +x "$_tw/my-notify.stub"
   T_CONF="$_tw/conf"
   T_WFDIR="$_tw/wf"
   # trash lives in a different place per machine; the suite must not depend on
@@ -2721,6 +2740,7 @@ _EOSTUB_
           -e "s|^T_PATH_FAILED=.*|T_PATH_FAILED=\"$_tw/failed\"|" \
           -e "s|^WORKFLOW_DIR=.*|WORKFLOW_DIR=\"$_tw/wf\"|" \
           -e "s|^MY_OCR=.*|MY_OCR=\"$_tw/my-ocr.stub\"|" \
+          -e "s|^my_notify=.*|my_notify=\"$_tw/my-notify.stub\"|" \
           -e "s|^SCAN_DEVICE=.*|SCAN_DEVICE=\"\"|" \
           -e "s|^LOG=.*|LOG=\"\"|" \
           -e "s|^SETTLE_TIMEOUT=.*|SETTLE_TIMEOUT=20|" \
@@ -3223,6 +3243,80 @@ t_reset_delegates() {
   fi
 }
 
+# ---- --test-mail goes the alerts' way, and never passes with mail off ----
+t_test_mail() {
+  _d="$T_TMP/testmail"; t_world "$_d"
+  _a="$_d/notify.args"
+  { cat "$T_CONF"
+    printf '%s\n' 'NOTIFY_VIA="notify,mail"' 'NOTIFY_SUBJECT_MARKER="[my-scan]"' \
+      'NOTIFY_MAIL_TO="to@example.invalid"' 'NOTIFY_MAIL_FROM="from@example.invalid"'
+  } >"$_d/conf.mail"
+  t_pdf "$_d/drop/untouched.pdf"
+
+  # sent: exactly ONE my-notify call, the mail, with from/to/subject/body
+  rm -f "$_a"
+  _o="$("$0" --config "$_d/conf.mail" --test-mail process --all 2>&1 </dev/null)"; _r=$?
+  case "$_r|$_o" in
+    "0|"*"test mail sent to to@example.invalid [my-notify rc 0]"*)
+      t_ok "test-mail: sent, and says to whom [rc 0]";;
+    *) t_bad "test-mail: sent, and says to whom [rc 0]" "rc=$_r: $(printf '%s' "$_o" | tail -n 1)";;
+  esac
+  _calls="$(grep -c '^---$' "$_a" 2>/dev/null)"
+  _head="$(head -n 4 "$_a" 2>/dev/null | tr '\n' '|')"
+  if [ "$_calls" = 1 ] && [ "$_head" = "--mail|from@example.invalid|to@example.invalid|[my-scan] $US test mail|" ]; then
+    t_ok "test-mail: one mail through my-notify --mail <from> <to> <subject> <body>"
+  else
+    t_bad "test-mail: one mail through my-notify --mail <from> <to> <subject> <body>" \
+      "calls=$_calls args=$_head"
+  fi
+  if grep -q "^Config:  $_d/conf.mail\$" "$_a" && grep -q '^Host:  ' "$_a" \
+     && grep -q '^User:  ' "$_a" && grep -q '^Time:  ' "$_a"; then
+    t_ok "test-mail: the body names host, user, time and the config file"
+  else
+    t_bad "test-mail: the body names host, user, time and the config file" "$(tr '\n' '|' <"$_a")"
+  fi
+  if [ -f "$_d/drop/untouched.pdf" ] && [ ! -e "$_d/ocr.called" ]; then
+    t_ok "test-mail: does none of the tool's normal work"
+  else
+    t_bad "test-mail: does none of the tool's normal work" "the drop folder was processed"
+  fi
+
+  # no NOTIFY_MAIL_TO: my-notify's own default, so no empty address is passed
+  rm -f "$_a"
+  sed -e 's|^NOTIFY_MAIL_TO=.*|NOTIFY_MAIL_TO=""|' "$_d/conf.mail" >"$_d/conf.noto"
+  _o="$("$0" --config "$_d/conf.noto" --test-mail 2>&1 </dev/null)"; _r=$?
+  _head="$(head -n 3 "$_a" 2>/dev/null | tr '\n' '|')"
+  case "$_r|$_head|$_o" in
+    "0|--mail|[my-scan] $US test mail|"*"|"*"the my-notify default recipient [my-notify rc 0]"*)
+      t_ok "test-mail: no recipient configured -> my-notify's default, and says so";;
+    *) t_bad "test-mail: no recipient configured -> my-notify's default, and says so" "rc=$_r args=$_head";;
+  esac
+
+  # my-notify fails: non-zero, and its rc is shown
+  rm -f "$_a"; echo 3 >"$_d/notify.rc"
+  _o="$("$0" --config "$_d/conf.mail" --test-mail 2>&1 </dev/null)"; _r=$?
+  rm -f "$_d/notify.rc"
+  case "$_r|$_o" in
+    0\|*) t_bad "test-mail: a failing my-notify fails the test, with its rc" "rc=0";;
+    *"ERROR 088"*"[my-notify rc 3]"*) t_ok "test-mail: a failing my-notify fails the test, with its rc";;
+    *) t_bad "test-mail: a failing my-notify fails the test, with its rc" "$(printf '%s' "$_o" | tail -n 1)";;
+  esac
+
+  # mail switched off: a FAILURE, and nothing is sent at all
+  for _via in notify ""; do
+    rm -f "$_a"
+    sed -e "s|^NOTIFY_VIA=.*|NOTIFY_VIA=\"$_via\"|" "$_d/conf.mail" >"$_d/conf.off"
+    _o="$("$0" --config "$_d/conf.off" --test-mail 2>&1 </dev/null)"; _r=$?
+    case "$_r|$_o" in
+      0\|*) t_bad "test-mail: NOTIFY_VIA='$_via' (mail off) fails" "rc=0 -- a passing test with mail off";;
+      *"ERROR 085"*)
+        if [ -e "$_a" ]; then t_bad "test-mail: NOTIFY_VIA='$_via' (mail off) fails" "my-notify was called anyway"
+        else t_ok "test-mail: NOTIFY_VIA='$_via' (mail off) fails, and sends nothing"; fi;;
+      *) t_bad "test-mail: NOTIFY_VIA='$_via' (mail off) fails" "$(printf '%s' "$_o" | tail -n 1)";;
+    esac
+  done
+}
+
 # ---- my-ocr's own suite, because the two belong together -----------------
 t_my_ocr_suite() {
   # the REAL my-ocr, not the stub: read it from a default config, since
@@ -3263,12 +3357,46 @@ do_run_tests() {
   t_retry
   t_listing_not_swallowed_by_log
   t_reset_delegates
+  t_test_mail
   t_my_ocr_suite
   rm -rf "$T_TMP"
   _p "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
   [ "$T_FAIL" -eq 0 ]
 }
+
+##############################################################################
+#### --test-mail
+# Sends through the config's own notify_mail() -- the call the real alerts make
+# -- so a passing test says something about them. Mail being off is a FAILURE:
+# a test that passes while no alert could ever arrive would be a lie.
+
+do_test_mail() {
+  case ",$NOTIFY_VIA," in
+    *,mail,*) ;;
+    *) err 085 "mail is off in '$CONFIG_FILE': NOTIFY_VIA='$NOTIFY_VIA' has no 'mail'." ;;
+  esac
+  command -v notify_mail >/dev/null 2>&1 \
+    || err 086 "'$CONFIG_FILE' defines no notify_mail() -- it predates it; regenerate it from --create-config."
+  [ -x "$my_notify" ] || err 087 "my_notify='$my_notify' is not executable."
+
+  _tm_to="${NOTIFY_MAIL_TO:-the my-notify default recipient}"
+  _tm_body="This is a test mail from '$US --test-mail'. It went out through
+notify_mail(), the call my-scan's real alert mails use.
+
+Host:    $(hostname -s)
+User:    $(id -un)
+Time:    $(date '+%Y-%m-%d %H:%M:%S %Z')
+Config:  $CONFIG_FILE
+Version: $(do_version)"
+
+  notify_mail "$US test mail" "$_tm_body"
+  _tm_rc=$?
+  [ "$_tm_rc" -eq 0 ] || err 088 "test mail to $_tm_to NOT sent [my-notify rc $_tm_rc]"
+  msg "test mail sent to $_tm_to [my-notify rc $_tm_rc]"
+  return 0
+}
+
 
 ##############################################################################
 #### USAGE
@@ -3315,6 +3443,9 @@ OPTIONS:
   --run-tests               Run the regression suite -- every stage of my-scan
                             against temp dirs and a stub my-ocr, then my-ocr's
                             own suite. Starts no scan and no OCR.
+  --test-mail               Send ONE test mail the way the alerts go (NOTIFY_VIA,
+                            NOTIFY_MAIL_TO/_FROM, my_notify) and exit. Fails when
+                            mail is off in the config or my-notify fails.
 
 SCAN OPTIONS:
   -w|--wait                 Wait for a document in the feeder
@@ -3338,6 +3469,7 @@ EXAMPLES:
   $US                                     print this usage
   $US scan                                scan the feeder, else the flatbed
   $US --duplex bank-statement.pdf         duplex scan to a named file
+  $US --test-mail                         does an alert mail reach you?
   $US setup                               dry-run the Folder Action install
   $US setup go                            apply it
   $US uninstall                           dry-run removing the Folder Action
@@ -3374,6 +3506,7 @@ while [ $# -gt 0 ]; do
     -DD|--deepdebug)     DEEPDBG=1; case "$1" in ""|-*) ;; *) DBG_LOGFILE="$1"; shift ;; esac ;;
     -L|--no-log)         NO_LOG=1 ;;
     --run-tests)         RUN_TESTS=1 ;;
+    --test-mail)         TEST_MAIL=1 ;;
     --watch)             WATCH=1; case "$1" in ""|-*) ;; *) WATCH_INTERVAL_OVERRIDE="$1"; shift ;; esac ;;
     --watch=*)           WATCH=1; WATCH_INTERVAL_OVERRIDE="${_a#--watch=}" ;;
     --dry-run)           DRY_RUN=1 ;;
@@ -3430,6 +3563,9 @@ if [ -n "$WATCH_INTERVAL_OVERRIDE" ]; then
     || err 079 "--watch interval '$WATCH_INTERVAL_OVERRIDE' is not a positive number."
   WATCH_INTERVAL="$WATCH_INTERVAL_OVERRIDE"
 fi
+
+# --test-mail needs the config (that is what it tests) and nothing else
+[ -n "$TEST_MAIL" ] && { do_test_mail; exit $?; }
 
 NOW="$(date +"%Y-%m-%d_%H%M.%S")"
 
