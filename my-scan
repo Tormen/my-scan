@@ -11,7 +11,7 @@
 # 088 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="44ac2de"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="48db9d0"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 
 US="${0##*/}"
 
@@ -3574,6 +3574,28 @@ t_help_claims() {
   t_ok "every config key --help names exists in the default config and is read"
 }
 
+# "my-scan -DD process" must run PROCESS, not swallow it as a debug log path.
+# It did, and the run reported success while doing nothing whatsoever.
+t_opt_arg_not_subcommand() {
+  _d="$T_TMP/optarg"; t_world "$_d"
+  t_pdf "$_d/drop/opt.pdf"
+  # the flag FIRST, with the subcommand after it -- the form that broke
+  "$0" --config "$T_CONF" -DD process --all >/dev/null 2>&1 </dev/null
+  if [ -f "$_d/ocr.called" ]; then
+    t_ok "-DD before the subcommand still runs it (the flag does not swallow 'process')"
+  else
+    t_bad "-DD before the subcommand still runs it (the flag does not swallow 'process')" \
+          "nothing ran -- 'process' was taken as the debug log path"
+  fi
+  # ...and a real path after -D is still accepted as its log file
+  "$0" --config "$T_CONF" -D "$_d/dbg.log" status >/dev/null 2>&1 </dev/null
+  if [ -f "$_d/dbg.log" ]; then
+    t_ok "-D <PATH> still takes a genuine path as its debug log"
+  else
+    t_bad "-D <PATH> still takes a genuine path as its debug log" "no log written"
+  fi
+}
+
 do_run_tests() {
   _p "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-scan.tests.XXXXXX)" || { _p "mktemp failed"; return 1; }
@@ -3596,6 +3618,7 @@ do_run_tests() {
   t_reset_delegates
   t_test_mail
   t_help_claims
+  t_opt_arg_not_subcommand
   t_dry_run
   t_config_keys
   t_qpdf_autodetect
@@ -3740,6 +3763,20 @@ _EOU_
 ##############################################################################
 #### MAIN
 
+# Does this word belong to the PRECEDING optional-argument flag, or is it the
+# subcommand? "-DD process" must not read 'process' as a debug log path: that
+# left no subcommand, so the tool printed its usage, exited 0, and processed
+# nothing -- a run that looked like it had worked. An empty word, a flag, or a
+# known subcommand is never the flag's argument.
+opt_arg() { # $1 = the next word. 0 = it is this flag's argument.
+  case "$1" in
+    ""|-*) return 1 ;;
+    scan|process|setup|install|uninstall|status|cancel|reset|devices|stamp-version)
+           return 1 ;;
+    *)     return 0 ;;
+  esac
+}
+
 ARGS=""
 while [ $# -gt 0 ]; do
   _a="$1"; shift
@@ -3748,12 +3785,12 @@ while [ $# -gt 0 ]; do
     --version)           do_version; exit 0 ;;
     -Q|--quiet)          QUIET=1 ;;
     -V|--verbose)        VRB=1 ;;
-    -D|--debug)          DBG=1; case "$1" in ""|-*) ;; *) DBG_LOGFILE="$1"; shift ;; esac ;;
-    -DD|--deepdebug)     DEEPDBG=1; case "$1" in ""|-*) ;; *) DBG_LOGFILE="$1"; shift ;; esac ;;
+    -D|--debug)          DBG=1; opt_arg "$1" && { DBG_LOGFILE="$1"; shift; } ;;
+    -DD|--deepdebug)     DEEPDBG=1; opt_arg "$1" && { DBG_LOGFILE="$1"; shift; } ;;
     -L|--no-log)         NO_LOG=1 ;;
     --run-tests)         RUN_TESTS=1 ;;
     --test-mail)         TEST_MAIL=1 ;;
-    --watch)             WATCH=1; case "$1" in ""|-*) ;; *) WATCH_INTERVAL_OVERRIDE="$1"; shift ;; esac ;;
+    --watch)             WATCH=1; opt_arg "$1" && { WATCH_INTERVAL_OVERRIDE="$1"; shift; } ;;
     --watch=*)           WATCH=1; WATCH_INTERVAL_OVERRIDE="${_a#--watch=}" ;;
     --dry-run)           DRY_RUN=1 ;;
     --config)            CONFIG="$1"; shift ;;
