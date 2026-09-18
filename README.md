@@ -218,9 +218,17 @@ cosmetic warnings.
 
 **On the way out**, before the result may replace the original, my-ocr requires
 all of: it parses, its page count is **not lower** than the input's, its
-Producer names the OCR application, `qpdf --check` passes, and it carries a
-text layer. More pages out is fine -- the OCR application splits a sheet it
-believes holds several pages.
+Producer names the OCR application, and `qpdf --check` passes. More pages out
+is fine -- the OCR application splits a sheet it believes holds several pages.
+
+A result with **no text** is NOT refused. Those four checks are the evidence
+that the OCR ran correctly; a page with nothing to recognise simply yields no
+text, which describes the document -- a photograph, a blank sheet -- not a
+broken run. The ORIGINAL is kept, tagged `Producer: FineReader (my-ocr: no text
+found -- original kept)` so a later run knows not to repeat the work, and filed
+as done; the OCR output is discarded. It is counted on its own line, so a
+misconfigured OCR finding nothing in everything cannot hide in the success
+total.
 
 Deliberately NOT checked: file size (MRC compression makes a much smaller
 result the healthy outcome) and image counts (MRC splits one scan image into
