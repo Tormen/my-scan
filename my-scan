@@ -11,7 +11,7 @@
 # 088 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="48db9d0"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="6d02b21"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 
 US="${0##*/}"
 
@@ -76,8 +76,17 @@ IGNORED_CNT=0
 
 _p() { printf '%s\n' "$*"; }
 
-# pipeline-prefixed echo (the log format the Automator-driven parts use)
-pe() { printf '%s|%s\n' "$LOGPFX" "$*"; }
+# -Q silences the TERMINAL, never the record. Once process_start_log() has
+# redirected stdout into the logfile, LOG_IS_STDERR is set and QUIET must not
+# blank it: the log is the trail that makes an unattended run diagnosable, and
+# it is not what anyone is being spared. 0 = suppress this line.
+quiet_out() { [ "$QUIET" = "1" ] && [ -z "$LOG_IS_STDERR" ]; }
+
+# pipeline-prefixed echo (the log format the Automator-driven parts use).
+# pe_raw is the UNGATED form: err() must print through it, or "quiet except
+# errors" quietly becomes "quiet including errors".
+pe_raw() { printf '%s|%s\n' "$LOGPFX" "$*"; }
+pe() { quiet_out && return 0; pe_raw "$*"; }
 
 msg()  { [ "$QUIET" = "1" ] && return 0; _p " >>> $*"; }
 msg2() { [ "$QUIET" = "1" ] && return 0; _p "  >> $*"; }
@@ -119,12 +128,12 @@ err() {
 
   # make sure the error reaches the log even while stdout is restored
   if [ -n "$LOG" ] && [ -z "$REDIRECT_TO_LOG" ] && [ -z "$LOG_IS_STDERR" ]; then
-    { echo; pe ""; pe "$_now|$_outp"; } >>"$LOG" 2>/dev/null
+    { echo; pe_raw ""; pe_raw "$_now|$_outp"; } >>"$LOG" 2>/dev/null
   fi
-  { echo; pe ""; pe "$_now|$_outp"; } 1>&2
+  { echo; pe_raw ""; pe_raw "$_now|$_outp"; } 1>&2
 
   if [ -n "$NFY" ] && [ -x "$my_notify" ]; then
-    pe "LAUNCHING: \"$my_notify\" -- \"ERROR $_errCode [$_exitCode]:\" \"$_msg\"" 1>&2
+    pe_raw "LAUNCHING: \"$my_notify\" -- \"ERROR $_errCode [$_exitCode]:\" \"$_msg\"" 1>&2
     "$my_notify" -- "ERROR $_errCode [$_exitCode]:" "$_msg"
   fi
 
@@ -1232,10 +1241,20 @@ ocr_one_chunk() {
   while IFS= read -r _cf; do [ -n "$_cf" ] && set -- "$@" "$_cf"; done <<_EOCH_
 $_chunk
 _EOCH_
-  if "$@"; then
+  # my-ocr inherits this stdout, so silencing my-scan alone would not be quiet.
+  # Its narration goes to stdout and its errors to stderr (checked), so under
+  # -Q we drop only stdout -- every error still reaches the caller.
+  if quiet_out; then
+    "$@" >/dev/null; _oc_rc=$?
+  else
+    "$@"; _oc_rc=$?
+  fi
+  # the status, captured: inside an else-branch "$?" is the IF condition's
+  # status, which is right here only by accident and says nothing to a reader
+  if [ "$_oc_rc" -eq 0 ]; then
     pe "  >  $MY_OCR finished [0]"
   else
-    err 069 "$MY_OCR failed [$?] -- see its own log; files it could not OCR are in '$T_PATH_FAILED'." "-"
+    err 069 "$MY_OCR failed [$_oc_rc] -- see its own log; files it could not OCR are in '$T_PATH_FAILED'." "-"
   fi
   file_ocred_results "$_chunk"
   return 0
@@ -1349,7 +1368,8 @@ do_process() {
       exec 3<&1
     fi
     NOW="$(date +"%Y-%m-%d_%H%M.%S")"
-    echo; pe ""
+    quiet_out || echo
+    pe ""
   }
 
   # Three ways in:
@@ -1532,11 +1552,15 @@ _EOPI_
 
   pe ""
   _pfx="$LOGPFX|>RESULT<| "
+  # a summary IS the noise a crontab mails every night -- gated like the rest,
+  # and still written in full whenever the destination is the logfile
+  if ! quiet_out; then
   printf "%sGot %4d file(s):\n"                 "$_pfx" "$INP_FILES_CNT"
   printf "%s  > %4d OCRed and filed.\n"         "$_pfx" "$FILES_OCRED_CNT"
   printf "%s  > %4d filed without OCR.\n"       "$_pfx" "$IGNORED_CNT"
   printf "%s  > %4d failed (of which %d wrong file type).\n" \
                                                 "$_pfx" "$FAILED_CNT" "$WRONG_FILETYPE_CNT"
+  fi
 
   pe ""
   pe "$(date +"%Y-%m-%d_%H%M.%S") DONE."
@@ -3596,6 +3620,58 @@ t_opt_arg_not_subcommand() {
   fi
 }
 
+# -Q is about the TERMINAL, not the record. It silenced nothing at all until
+# 2026-09-18: the process path printed through pe(), which had no QUIET check,
+# and it LOOKED right only because output was redirected into the logfile.
+t_quiet() {
+  _d="$T_TMP/quiet"; t_world "$_d"
+  t_pdf "$_d/drop/q1.pdf"
+
+  # with the log OFF the terminal IS the stream -- the only honest test
+  _qb="$("$0" --config "$T_CONF" -L --dry-run process --all 2>&1 </dev/null)"
+  _nb="$(printf '%s\n' "$_qb" | grep -c .)"
+  _qq="$("$0" --config "$T_CONF" -Q -L --dry-run process --all 2>&1 </dev/null)"
+  _nq="$(printf '%s\n' "$_qq" | grep -c .)"
+  if [ "$_nb" -gt 0 ] && [ "$_nq" -eq 0 ]; then
+    t_ok "-Q with the log off prints nothing ($_nb -> $_nq lines)"
+  else
+    t_bad "-Q with the log off prints nothing" "bare=$_nb quiet=$_nq -- equal counts mean QUIET does nothing"
+  fi
+
+  # ...but an ERROR must still come through, or the flag is a muzzle
+  _qe="$(printf '%s\n' "/nonexistent/nope.pdf" | "$0" --config "$T_CONF" -Q -L process 2>&1)"
+  case "$_qe" in
+    *ERROR*) t_ok "-Q still prints errors";;
+    *)       t_bad "-Q still prints errors" "the silence swallowed the error too";;
+  esac
+
+  # my-ocr's narration must be silenced too -- but never its errors. The stub
+  # fails on a *BOOM* file, which reaches us as err 069 on stderr.
+  t_pdf "$_d/drop/BOOM.pdf"
+  _qo="$("$0" --config "$T_CONF" -Q -L process --all 2>&1 </dev/null)"
+  case "$_qo" in
+    *"ERROR 069"*) t_ok "-Q keeps my-ocr's failure visible (stderr survives the silence)";;
+    *) t_bad "-Q keeps my-ocr's failure visible (stderr survives the silence)" \
+             "a failing OCR was swallowed: $(printf '%s' "$_qo" | head -n 1)";;
+  esac
+  # ...and it must be STDOUT that is dropped, never stderr
+  if sed -n '/^ocr_one_chunk()/,/^}/p' "$0" | grep -q '"\$@" >/dev/null'; then
+    t_ok "-Q drops my-ocr's stdout only (its errors are on stderr)"
+  else
+    t_bad "-Q drops my-ocr's stdout only (its errors are on stderr)" "not wired in"
+  fi
+
+  # ...and a configured LOGFILE must still receive everything
+  sed -e "s|^LOG=.*|LOG=\"$_d/run.log\"|" "$T_CONF" >"$_d/conf.withlog"
+  t_pdf "$_d/drop/q2.pdf"
+  "$0" --config "$_d/conf.withlog" -Q process --all >/dev/null 2>&1 </dev/null
+  if [ -s "$_d/run.log" ]; then
+    t_ok "-Q does not blank the logfile (the record survives)"
+  else
+    t_bad "-Q does not blank the logfile (the record survives)" "the log is empty -- the audit trail is gone"
+  fi
+}
+
 do_run_tests() {
   _p "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-scan.tests.XXXXXX)" || { _p "mktemp failed"; return 1; }
@@ -3619,6 +3695,7 @@ do_run_tests() {
   t_test_mail
   t_help_claims
   t_opt_arg_not_subcommand
+  t_quiet
   t_dry_run
   t_config_keys
   t_qpdf_autodetect
