@@ -10,8 +10,12 @@
 #
 # 088 == highest used errCode
 
-SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="31d67cd"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_VERSION="v1.0"
+SCRIPT_COMMIT="0377178"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+# What git said when this build was stamped: 'git describe --tags --long' --
+# <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
+# ARE that release or work on top of it, on a machine with no git.
+SCRIPT_RELEASE="v1.0-14-g0377178"
 
 US="${0##*/}"
 
@@ -548,13 +552,31 @@ build_id() {
   _p "$_h"
 }
 
+# SCRIPT_VERSION names the release these bytes are BASED on -- only a release
+# commit sets it. Whether they ARE that release is git's own describe string,
+# printed verbatim. Git first (exact in a checkout), the stamp second (a
+# deployed copy has no git; it lags one release step, because stamping
+# happens before the tag exists).
 do_version() {
   _bid="$(build_id)"
-  if [ -n "$SCRIPT_COMMIT" ]; then
-    _p "$US $SCRIPT_VERSION (commit $SCRIPT_COMMIT, build $_bid)"
-  else
-    _p "$US $SCRIPT_VERSION (build $_bid, unstamped)"
-  fi
+  _vd="$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)"
+  [ -n "$_vd" ] || _vd="$SCRIPT_RELEASE"
+  case "$_vd" in
+    *-*-g*)
+      _vtag="${_vd%-*-g*}"
+      _vn="${_vd%-g*}"; _vn="${_vn##*-}"
+      if [ "$_vn" = 0 ]; then
+        _p "$US $SCRIPT_VERSION ($_vd: the $_vtag tag, build $_bid)"
+      else
+        _p "$US $SCRIPT_VERSION+$_vn ($_vd: $_vn commit(s) past $_vtag, unreleased, build $_bid)"
+      fi ;;
+    *)
+      if [ -n "$SCRIPT_COMMIT" ]; then
+        _p "$US $SCRIPT_VERSION (commit $SCRIPT_COMMIT, build $_bid)"
+      else
+        _p "$US $SCRIPT_VERSION (build $_bid, unstamped)"
+      fi ;;
+  esac
 }
 
 do_stamp_version() {
@@ -579,8 +601,11 @@ do_stamp_version() {
     return 0
   fi
 
+  # git's own spelling, kept verbatim so it can be pasted back into git
+  _desc="$(git -c safe.directory='*' -C "$_dir" describe --tags --long 2>/dev/null)"
   _tmp="$0.stamp.$$"
-  sed -e "s|^SCRIPT_COMMIT=\".*\"|SCRIPT_COMMIT=\"$_sha\"|" "$0" >"$_tmp" \
+  sed -e "s|^SCRIPT_COMMIT=\".*\"|SCRIPT_COMMIT=\"$_sha\"|" \
+      -e "s|^SCRIPT_RELEASE=\".*\"|SCRIPT_RELEASE=\"$_desc\"|" "$0" >"$_tmp" \
     || { rm -f "$_tmp"; err 010 "FAILED to rewrite SCRIPT_COMMIT."; }
   grep -q "^SCRIPT_COMMIT=\"$_sha\"" "$_tmp" \
     || { rm -f "$_tmp"; err 011 "SCRIPT_COMMIT line not found -- refusing to install."; }
@@ -593,7 +618,7 @@ do_stamp_version() {
   run git -C "$_dir" add -- "$US" || err 013 "git add failed."
   run git -C "$_dir" commit --amend --no-edit || err 014 "git commit --amend failed."
 
-  msg "Stamped $US with commit $_sha [$(build_id)]"
+  msg "Stamped $US with commit $_sha, release ${_desc:-<no tag yet>} [$(build_id)]"
   det "the stamped sha lags HEAD by one: amending changes the sha. That is expected;"
   det "do not 'fix' it. The build id above identifies these exact bytes."
   return 0
