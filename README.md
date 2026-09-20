@@ -209,7 +209,12 @@ moves it to the Trash a moment earlier.
 **On the way in**, once per delivery after it settles: `qpdf --check`. qpdf is
 located the way lsof is -- `c_qpdf`, then `QPDF_SEARCH`, then `$PATH` -- and if
 it cannot be found at all you are told loudly, because a gate you believe is
-running but is not is worse than no gate. settle's
+running but is not is worse than no gate. `pdfinfo` is located the same way
+(`c_pdfinfo`, `PDFINFO_SEARCH`, `$PATH`): Homebrew puts it under
+`/opt/homebrew/bin` on Apple Silicon and `/usr/local/bin` on Intel, so one
+hard-coded path is wrong on one of the two machines -- and a my-scan that
+cannot run `pdfinfo` reports every readable document as BROKEN. Where it is
+genuinely absent, `status` says it cannot count pages instead of guessing. settle's
 own parse test only proves `pdfinfo` can read the catalogue; a file whose page
 CONTENT was damaged in transit passes that and fails this. qpdf's exit is
 graded and read as such -- 0 clean, 3 warnings only, 2 damage -- because

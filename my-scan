@@ -11,7 +11,7 @@
 # 088 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="6d02b21"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="31d67cd"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 
 US="${0##*/}"
 
@@ -423,7 +423,14 @@ MY_OCR="/LINKS/bin/my-ocr"
 c_trash="/usr/local/bin/trash"
 c_convert="/usr/local/bin/convert"
 c_identify="/usr/local/bin/identify"
-c_pdfinfo="/usr/local/bin/pdfinfo"
+# Empty is the default, and means "look for it": Homebrew installs pdfinfo in
+# /opt/homebrew/bin on Apple Silicon and /usr/local/bin on Intel, so ONE
+# hard-coded path is wrong on one of the two machines -- and a missing pdfinfo
+# makes every readable PDF look BROKEN. my-scan looks in PDFINFO_SEARCH and
+# then $PATH, the way it does for lsof and qpdf. A wrong path here is named,
+# never silently ignored.
+c_pdfinfo=""
+PDFINFO_SEARCH="/opt/homebrew/bin/pdfinfo /usr/local/bin/pdfinfo /usr/bin/pdfinfo"
 c_lsof="/usr/sbin/lsof"
 # qpdf validates every object and stream; pdfinfo reads only the trailer,
 # catalog and page tree. A delivery whose CONTENT is damaged passes pdfinfo
@@ -1016,13 +1023,39 @@ page_count() { # $1 = file
 # Same shape as find_lsof: a configured path wins, then the usual places, then
 # $PATH. A config written before c_qpdf existed must not silently disable the
 # gate -- that is how the check shipped inert on a host that HAD qpdf.
+find_pdfinfo() {
+  { [ -n "$c_pdfinfo" ] && [ -x "$c_pdfinfo" ]; } && return 0
+  if [ -n "$c_pdfinfo" ] && [ -z "$PDFINFO_WARNED" ]; then
+    PDFINFO_WARNED=1
+    err 089 "c_pdfinfo '$c_pdfinfo' is not executable -- searching the usual places instead." "-"
+  fi
+  # ONE list: the config's if it has one, the built-in only as its default.
+  # Appending the built-in unconditionally made PDFINFO_SEARCH impossible to
+  # narrow -- a config that named one path still searched four.
+  # shellcheck disable=SC2086  # deliberate: the list is words, not one path
+  for _c in ${PDFINFO_SEARCH:-/opt/homebrew/bin/pdfinfo /usr/local/bin/pdfinfo /usr/bin/pdfinfo}; do
+    [ -x "$_c" ] && c_pdfinfo="$_c" && return 0
+  done
+  c_pdfinfo="$(command -v pdfinfo 2>/dev/null)"
+  { [ -n "$c_pdfinfo" ] && [ -x "$c_pdfinfo" ]; } && return 0
+  if [ -z "$PDFINFO_WARNED" ]; then
+    PDFINFO_WARNED=1
+    err 090 "pdfinfo not found -- page counts and the parses check are UNAVAILABLE.
+Without it every readable PDF looks damaged, which is worse than saying so.
+Install it (brew install poppler), or set c_pdfinfo in the config." "-"
+  fi
+  return 1
+}
+
 find_qpdf() {
   { [ -n "$c_qpdf" ] && [ -x "$c_qpdf" ]; } && return 0
   if [ -n "$c_qpdf" ] && [ -z "$QPDF_WARNED" ]; then
     QPDF_WARNED=1
     err 020 "c_qpdf '$c_qpdf' is not executable -- searching the usual places instead." "-"
   fi
-  for _c in $QPDF_SEARCH /opt/homebrew/bin/qpdf /usr/local/bin/qpdf /usr/bin/qpdf; do
+  # ONE list, as for pdfinfo: the config's, or the built-in as its default.
+  # shellcheck disable=SC2086  # deliberate: the list is words, not one path
+  for _c in ${QPDF_SEARCH:-/opt/homebrew/bin/qpdf /usr/local/bin/qpdf /usr/bin/qpdf}; do
     [ -x "$_c" ] && c_qpdf="$_c" && return 0
   done
   c_qpdf="$(command -v qpdf 2>/dev/null)"
@@ -1141,6 +1174,11 @@ count_docs_pages() { # $1 = dir
   if [ "$_cdp_n" -gt "$_lim" ] && [ "$VRB" != "1" ]; then
     printf '%s files (-V looks at them)\n' "$_cdp_n"; return 0
   fi
+  # Without pdfinfo NOTHING can be classified, and every readable PDF would be
+  # counted BROKEN -- a confident answer that is wrong. Say what is true.
+  if ! find_pdfinfo; then
+    printf '%s file(s) -- cannot count pages: pdfinfo not found\n' "$_cdp_n"; return 0
+  fi
   _cdp_ok=0; _cdp_p=0; _cdp_br=0; _cdp_em=0; _cdp_ot=0
   _cdp_t="$(mktemp /tmp/my-scan.pages.XXXXXX)" || { printf '%s files\n' "$_cdp_n"; return 0; }
   candidate_files "$1" >"$_cdp_t"
@@ -1156,8 +1194,23 @@ count_docs_pages() { # $1 = dir
     esac
   done <"$_cdp_t"
   rm -f "$_cdp_t"
+  # The classes must ADD UP to the files walked. "5 document(s) / 14 page(s),
+  # 6 BROKEN, 1 EMPTY" was printed for TWELVE files, because the leading count
+  # named only the 'ok' class while the others were listed beside it -- a line
+  # that cannot be read as true. So: lead with the total whenever the classes
+  # differ, and refuse to print a sum that does not reconcile.
+  _cdp_sum=$(( _cdp_ok + _cdp_br + _cdp_em + _cdp_ot ))
+  if [ "$_cdp_sum" != "$_cdp_n" ]; then
+    printf '%s file(s) -- COUNT MISMATCH: %s ok + %s broken + %s empty + %s other = %s\n' \
+      "$_cdp_n" "$_cdp_ok" "$_cdp_br" "$_cdp_em" "$_cdp_ot" "$_cdp_sum"
+    return 0
+  fi
   # the clean case stays clean; the rest is only named when it exists
-  _cdp_s="$_cdp_ok document(s) / $_cdp_p page(s)"
+  if [ "$_cdp_ok" = "$_cdp_n" ]; then
+    _cdp_s="$_cdp_ok document(s) / $_cdp_p page(s)"
+  else
+    _cdp_s="$_cdp_n file(s): $_cdp_ok document(s) / $_cdp_p page(s)"
+  fi
   [ "$_cdp_br" -gt 0 ] && _cdp_s="$_cdp_s, $_cdp_br BROKEN"
   [ "$_cdp_em" -gt 0 ] && _cdp_s="$_cdp_s, $_cdp_em EMPTY"
   [ "$_cdp_ot" -gt 0 ] && _cdp_s="$_cdp_s, $_cdp_ot not a document"
@@ -1353,7 +1406,7 @@ do_retry_batch() {
 
 do_process() {
   [ -x "$c_trash" ]   || err 064 "NOT FOUND: '$c_trash' (brew install trash)"
-  [ -x "$c_pdfinfo" ] || err 066 "NOT FOUND: '$c_pdfinfo' (brew install poppler)"
+  find_pdfinfo       || err 066 "NOT FOUND: pdfinfo (brew install poppler) -- every gate reads its page count."
   [ -x "$MY_OCR" ]    || err 067 "NOT FOUND: '$MY_OCR' -- my-scan hands every OCR to it."
 
   # The LOG redirect happens only once we are actually going to DO something.
@@ -2186,6 +2239,7 @@ setup_preflight() {
   if [ -d "$_act" ]; then det "OCR action     OK   $_act"
   else det "OCR action     MISSING at '$_act' -- the workflow's OCR step will not load"; _fail=1; fi
 
+  find_pdfinfo >/dev/null 2>&1; find_qpdf >/dev/null 2>&1   # report what is FOUND
   for _c in "$c_trash" "$c_convert" "$c_pdfinfo" "$c_qpdf" "$c_lsof"; do
     if [ -x "$_c" ]; then det "$(printf '%-14s' "${_c##*/}") OK   $_c"
     else det "$(printf '%-14s' "${_c##*/}") MISSING at '$_c'"; _fail=1; fi
@@ -3513,6 +3567,30 @@ t_config_keys() {
 
 # The gate shipped INERT on a host that had qpdf, because the config predated
 # c_qpdf and an unset path was read as "skip the check".
+t_pdfinfo_autodetect() {
+  _d="$T_TMP/pdfinfoauto"; mkdir -p "$_d"
+  t_pdf "$_d/a.pdf"; t_pdf "$_d/b.pdf"
+  # count_docs_pages is what `status` prints
+  _o="$( c_pdfinfo=""; PDFINFO_WARNED=""; count_docs_pages "$_d" 2>/dev/null )"
+  case "$_o" in
+    "2 document(s) / "*)
+      t_ok "pdfinfo is found even with c_pdfinfo unset ($_o)";;
+    *"BROKEN"*)
+      t_bad "pdfinfo is found even with c_pdfinfo unset" \
+            "a readable PDF was called BROKEN because pdfinfo was not found: '$_o'";;
+    *) t_bad "pdfinfo is found even with c_pdfinfo unset" "got '$_o'";;
+  esac
+  # ...and where it genuinely is not there, it says SO rather than 'BROKEN'
+  # shellcheck disable=SC2123  # deliberate: a PATH with no poppler in it is the
+  # whole point -- /usr/bin:/bin keeps find/wc/awk working, so ONLY pdfinfo is gone
+  _o2="$( c_pdfinfo="/nonexistent/pdfinfo"; PDFINFO_SEARCH="/nonexistent/pdfinfo"
+          PATH="/usr/bin:/bin"; PDFINFO_WARNED=""; count_docs_pages "$_d" 2>/dev/null )"
+  case "$_o2" in
+    *"cannot count pages"*) t_ok "no pdfinfo at all: it says so, instead of calling 2 files BROKEN";;
+    *) t_bad "no pdfinfo at all: it says so, instead of calling 2 files BROKEN" "got '$_o2'";;
+  esac
+}
+
 t_qpdf_autodetect() {
   if ! command -v qpdf >/dev/null 2>&1 && [ ! -x /usr/local/bin/qpdf ] \
      && [ ! -x /opt/homebrew/bin/qpdf ]; then
@@ -3672,6 +3750,30 @@ t_quiet() {
   fi
 }
 
+# "5 document(s) / 14 page(s), 6 BROKEN, 1 EMPTY" -- twelve files described as
+# five, because the lead count named one class and the others sat beside it.
+t_counts_add_up() {
+  _d="$T_TMP/counts"; t_world "$_d"
+  _q="$_d/failed"; mkdir -p "$_q"
+  t_pdf "$_q/good.pdf"                      # ok
+  : >"$_q/empty.pdf"                        # empty
+  printf '%%PDF-1.4\nnot a real pdf\n' >"$_q/broken.pdf"   # broken
+  _o="$(count_docs_pages "$_q")"
+  echo "$_o" | grep -q "COUNT MISMATCH" && { t_bad "counts: the classes reconcile" "$_o"; return; }
+  case "$_o" in
+    "3 file(s): 1 document(s)"*"1 BROKEN"*"1 EMPTY"*)
+      t_ok "counts: the line leads with the total and the classes add up ($_o)";;
+    *) t_bad "counts: the line leads with the total and the classes add up" "got '$_o'";;
+  esac
+  # the all-clean case must stay exactly as it reads today
+  _d2="$T_TMP/counts2"; mkdir -p "$_d2"; t_pdf "$_d2/a.pdf"; t_pdf "$_d2/b.pdf"
+  _o2="$(count_docs_pages "$_d2")"
+  case "$_o2" in
+    "2 document(s) / "*) t_ok "counts: an all-clean folder still reads '2 document(s) / N page(s)'";;
+    *) t_bad "counts: an all-clean folder still reads '2 document(s) / N page(s)'" "got '$_o2'";;
+  esac
+}
+
 do_run_tests() {
   _p "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-scan.tests.XXXXXX)" || { _p "mktemp failed"; return 1; }
@@ -3696,9 +3798,11 @@ do_run_tests() {
   t_help_claims
   t_opt_arg_not_subcommand
   t_quiet
+  t_counts_add_up
   t_dry_run
   t_config_keys
   t_qpdf_autodetect
+  t_pdfinfo_autodetect
   t_settle_giveup
   t_my_ocr_suite
   rm -rf "$T_TMP"
