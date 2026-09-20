@@ -11,11 +11,11 @@
 # 088 == highest used errCode
 
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="0377178"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="a6e8302"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-14-g0377178"
+SCRIPT_RELEASE="v1.0-15-ga6e8302"
 
 US="${0##*/}"
 
@@ -557,9 +557,25 @@ build_id() {
 # printed verbatim. Git first (exact in a checkout), the stamp second (a
 # deployed copy has no git; it lags one release step, because stamping
 # happens before the tag exists).
+# The directory holding the REAL file, symlinks resolved. /LINKS/bin/<tool> is
+# a farm link into ANOTHER repo, so asking git from there answers about THAT
+# repo -- and once it has a tag of its own, this tool would report a stranger's
+# release as its own.
+_self_dir() {
+  _sd_p=$0
+  while [ -L "$_sd_p" ]; do
+    _sd_t=$(readlink "$_sd_p") || break
+    case "$_sd_t" in
+      /*) _sd_p=$_sd_t ;;
+      *)  _sd_p=$(dirname "$_sd_p")/$_sd_t ;;
+    esac
+  done
+  (cd "$(dirname "$_sd_p")" 2>/dev/null && pwd -P)
+}
+
 do_version() {
   _bid="$(build_id)"
-  _vd="$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)"
+  _vd="$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)"
   [ -n "$_vd" ] || _vd="$SCRIPT_RELEASE"
   case "$_vd" in
     *-*-g*)
