@@ -11,11 +11,11 @@
 # 088 == highest used errCode
 
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="a6e8302"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="77c3232"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-15-ga6e8302"
+SCRIPT_RELEASE="v1.0-16-g77c3232"
 
 US="${0##*/}"
 
@@ -576,7 +576,18 @@ _self_dir() {
 do_version() {
   _bid="$(build_id)"
   _vd="$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)"
-  [ -n "$_vd" ] || _vd="$SCRIPT_RELEASE"
+  # describe answers about WHERE this file sits, not about what it is: a copy
+  # dropped in a foreign repo gets THAT repo's tags (/LINKS/global is one, and
+  # it holds the copies update-LINKS promotes). The stamped commit is the
+  # proof -- a repo that does not have it is not this tool's repo.
+  if [ -n "$_vd" ] && [ -n "$SCRIPT_COMMIT" ] \
+     && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
+    _vd=""
+  fi
+  # The stamp is a PAIR, written together: without SCRIPT_COMMIT there is no
+  # stamp to fall back to, and a lone SCRIPT_RELEASE would be a release claim
+  # nothing backs -- an unstamped file says so.
+  if [ -z "$_vd" ] && [ -n "$SCRIPT_COMMIT" ]; then _vd=$SCRIPT_RELEASE; fi
   case "$_vd" in
     *-*-g*)
       _vtag="${_vd%-*-g*}"
