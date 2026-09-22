@@ -11,11 +11,11 @@
 # 091 == highest used errCode
 
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="e76a878"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="a969f14"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-18-ge76a878"
+SCRIPT_RELEASE="v1.0-19-ga969f14"
 
 US="${0##*/}"
 
@@ -2123,7 +2123,10 @@ do_status() {
     done <"$_cls_t"
     rm -f "$_cls_t"
   fi
-  _p "${_pfx}          class $_cls_s std-res (MRC, <=${OCR_HIGH_RES_ABOVE_DPI} dpi) / $_cls_h high-res (keeps its resolution)"
+  # the EFFECTIVE threshold, not the raw setting: a config written before this
+  # existed has no such key, and printing "<= dpi" would say nothing at all
+  _cls_dt="$OCR_HIGH_RES_ABOVE_DPI"; isInt "$_cls_dt" || _cls_dt=300
+  _p "${_pfx}          class $_cls_s std-res (MRC, <=$_cls_dt dpi) / $_cls_h high-res (keeps its resolution)"
   queue_detail "$OCR_QUEUE_PATH" "$_pfx"
   _qf="$(count_files "$T_PATH_FAILED")"
   if [ "$_qf" = "0" ]; then
