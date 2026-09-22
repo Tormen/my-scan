@@ -11,11 +11,11 @@
 # 091 == highest used errCode
 
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="a969f14"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="01005cc"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-19-ga969f14"
+SCRIPT_RELEASE="v1.0-20-g01005cc"
 
 US="${0##*/}"
 
@@ -402,19 +402,6 @@ STAGE_LOCK_TIMEOUT=300
 # round trip costs ~25s of fixed overhead whatever the page count.
 #   0 or empty = no limit (one call for everything, the old behaviour)
 OCR_BATCH_MAX_PAGES=25
-
-# RESOLUTION CLASS -- which of my-ocr's two input folders a document is handed
-# to, and so which export settings it is OCRed with. my-ocr's std-res workflow
-# compresses with MRC, which brings anything above ~300 dpi back AT 300 and
-# leaves everything below it alone. So only a document with MORE than this many
-# dpi has something to lose, and only it is worth the high-res class, where the
-# resolution survives at 2.4-3x the size. Measured on the scan host, same files both
-# ways: 200 dpi in -> 200 out, 300 -> 300, 600 -> 300.
-OCR_HIGH_RES_ABOVE_DPI=300
-# When a file does not say its resolution -- an image, or a PDF whose images
-# cannot be read -- its PIXELS answer instead: A4 at 300 dpi is 3508 px on the
-# long side, so anything longer came from more than a 300 dpi page.
-OCR_HIGH_RES_ABOVE_PX=3600
 
 # Counting pages costs a pdfinfo per document (~25ms). Worth it for a queue,
 # not for a backlog: above this many files 'status' reports documents only and
@@ -1078,54 +1065,6 @@ page_cache_put() { # $1 = key, $2 = pages
   return 0
 }
 
-# Which class a document belongs in. dpi decides whenever it can be read --
-# an A3 page at exactly 300 dpi is 4960 px long and must NOT count as high-res,
-# which is why pixels are only the fallback for a file that states no dpi.
-ocr_class_of() { # $1 = file
-  _cl_f="$1"; _cl_d=0; _cl_p=0
-  # Cached the way page_count caches: keyed on size+mtime+path, so a retry of
-  # the same queue does not run pdfimages over every document again. A file
-  # that changed gets a new key, so a stale answer cannot survive an edit.
-  _cl_k="cls:$(file_size "$_cl_f"):$(file_mtime "$_cl_f"):$_cl_f"
-  _cl_c="$(page_cache_get "$_cl_k")" && { printf '%s\n' "$_cl_c"; return 0; }
-  # find_pdfinfo FIRST: pdfimages lives beside pdfinfo, and without resolving
-  # it the path would be "/pdfimages" -- unreadable, so every document would
-  # quietly classify as std-res and a 600 dpi picture would be downsampled.
-  find_pdfinfo >/dev/null 2>&1
-  _cl_img="${c_pdfinfo%/*}/pdfimages"          # poppler ships them together
-  case "$(file --brief "$_cl_f" 2>/dev/null | cut -f1 -d' ')" in
-    PDF)
-      if [ -x "$_cl_img" ]; then
-        # highest dpi and longest pixel side over every image on every page
-        _cl_r="$("$_cl_img" -list "$_cl_f" 2>/dev/null \
-                 | awk 'NR>2 { if ($13+0>d) d=$13+0
-                               if ($4+0>p)  p=$4+0
-                               if ($5+0>p)  p=$5+0 }
-                        END { printf "%d %d\n", d+0, p+0 }')"
-        _cl_d="${_cl_r%% *}"; _cl_p="${_cl_r##* }"
-      fi ;;
-    JPEG|PNG|TIFF)
-      if [ -n "$c_identify" ] && [ -x "$c_identify" ]; then
-        _cl_r="$("$c_identify" -format '%w %h' "$_cl_f" 2>/dev/null | head -n 1)"
-        _cl_p="${_cl_r%% *}"; _cl_h="${_cl_r##* }"
-        isInt "$_cl_h" && isInt "$_cl_p" && [ "$_cl_h" -gt "$_cl_p" ] && _cl_p="$_cl_h"
-      fi ;;
-  esac
-  isInt "$_cl_d" || _cl_d=0
-  isInt "$_cl_p" || _cl_p=0
-  # shellcheck disable=SC2153  # set by the config file, which is sourced
-  _cl_dt="$OCR_HIGH_RES_ABOVE_DPI"; isInt "$_cl_dt" || _cl_dt=300
-  _cl_pt="$OCR_HIGH_RES_ABOVE_PX";  isInt "$_cl_pt" || _cl_pt=3600
-  _cl_out="std-res"
-  if [ "$_cl_d" -gt 0 ]; then
-    [ "$_cl_d" -gt "$_cl_dt" ] && _cl_out="high-res"
-  elif [ "$_cl_p" -gt "$_cl_pt" ]; then
-    _cl_out="high-res"
-  fi
-  page_cache_put "$_cl_k" "$_cl_out"
-  printf '%s\n' "$_cl_out"
-}
-
 page_count() { # $1 = file
   _pk="$(file_size "$1"):$(file_mtime "$1"):$1"
   _pc="$(page_cache_get "$_pk")" && { printf '%s\n' "$_pc"; return 0; }
@@ -1382,27 +1321,8 @@ ocr_in_chunks() { # $1 = newline-separated staged paths
   _cap="$OCR_BATCH_MAX_PAGES"
   isInt "$_cap" || _cap=0
   _chunk=""; _chunk_pages=0; _chunk_no=0
-  _oc_all="$(mktemp /tmp/my-scan.chunk.XXXXXX)" || { _chunk="$1"; _chunk_class=""; ocr_one_chunk; return 0; }
-  printf '%s\n' "$1" >"$_oc_all"
-
-  # SPLIT BY CLASS FIRST. The class chooses the export settings for a whole
-  # my-ocr call, so a chunk that mixed classes would OCR one of them wrongly.
-  # The batcher picks the batches, so it simply never mixes them -- the page
-  # cap below then applies within each class.
-  _oc_std="$(mktemp /tmp/my-scan.std.XXXXXX)"; _oc_high="$(mktemp /tmp/my-scan.high.XXXXXX)"
-  while IFS= read -r _oc_f; do
-    [ -n "$_oc_f" ] || continue
-    case "$(ocr_class_of "$_oc_f")" in
-      high-res) printf '%s\n' "$_oc_f" >>"$_oc_high" ;;
-      *)        printf '%s\n' "$_oc_f" >>"$_oc_std"  ;;
-    esac
-  done <"$_oc_all"
-  rm -f "$_oc_all"
-
-  for _oc_cls in std-res high-res; do
-    case "$_oc_cls" in high-res) _oc_t="$_oc_high" ;; *) _oc_t="$_oc_std" ;; esac
-    [ -s "$_oc_t" ] || continue
-    _chunk_class="$_oc_cls"; _chunk=""; _chunk_pages=0
+  _oc_t="$(mktemp /tmp/my-scan.chunk.XXXXXX)" || { _chunk="$1"; ocr_one_chunk; return 0; }
+  printf '%s\n' "$1" >"$_oc_t"
   while IFS= read -r _oc_f; do
     [ -n "$_oc_f" ] || continue
     _fp=1
@@ -1417,9 +1337,8 @@ ocr_in_chunks() { # $1 = newline-separated staged paths
     _chunk="${_chunk}${_chunk:+$NL}$_oc_f"
     _chunk_pages=$(( _chunk_pages + _fp ))
   done <"$_oc_t"
-    [ -n "$_chunk" ] && ocr_one_chunk
-  done
-  rm -f "$_oc_std" "$_oc_high"
+  rm -f "$_oc_t"
+  [ -n "$_chunk" ] && ocr_one_chunk
   return 0
 }
 
@@ -1427,10 +1346,9 @@ ocr_one_chunk() {
   _chunk_no=$(( _chunk_no + 1 ))
   _cn="$(printf '%s\n' "$_chunk" | awk 'NF{n++} END{print n+0}')"
   if [ "$_cap" -gt 0 ]; then
-    pe "  >  chunk $_chunk_no: $_cn file(s), $_chunk_pages page(s) (cap $_cap)${_chunk_class:+ [$_chunk_class]}"
+    pe "  >  chunk $_chunk_no: $_cn file(s), $_chunk_pages page(s) (cap $_cap)"
   fi
   set -- "$MY_OCR" --move-failed-to "$T_PATH_FAILED"
-  [ -n "$_chunk_class" ] && set -- "$@" --class "$_chunk_class"
   while IFS= read -r _cf; do [ -n "$_cf" ] && set -- "$@" "$_cf"; done <<_EOCH_
 $_chunk
 _EOCH_
@@ -2107,26 +2025,6 @@ do_status() {
     _q2n="$_q2d  STRANDED: nothing will pick these up ('$US process --retry')"
   fi
   _p "${_pfx}QUEUE     2ocr  $OCR_QUEUE_PATH  $_q2n"
-  # ALWAYS, zeros included: which class a queued document will be OCRed as is
-  # the difference between keeping its resolution and losing it, so it is not
-  # a detail to discover only when something is pending.
-  _cls_s=0; _cls_h=0
-  _cls_t="$(mktemp /tmp/my-scan.cls.XXXXXX)" 2>/dev/null || _cls_t=""
-  if [ -n "$_cls_t" ]; then
-    candidate_files "$OCR_QUEUE_PATH" >"$_cls_t" 2>/dev/null
-    while IFS= read -r _cls_f; do
-      [ -n "$_cls_f" ] || continue
-      case "$(ocr_class_of "$_cls_f")" in
-        high-res) _cls_h=$(( _cls_h + 1 )) ;;
-        *)        _cls_s=$(( _cls_s + 1 )) ;;
-      esac
-    done <"$_cls_t"
-    rm -f "$_cls_t"
-  fi
-  # the EFFECTIVE threshold, not the raw setting: a config written before this
-  # existed has no such key, and printing "<= dpi" would say nothing at all
-  _cls_dt="$OCR_HIGH_RES_ABOVE_DPI"; isInt "$_cls_dt" || _cls_dt=300
-  _p "${_pfx}          class $_cls_s std-res (MRC, <=$_cls_dt dpi) / $_cls_h high-res (keeps its resolution)"
   queue_detail "$OCR_QUEUE_PATH" "$_pfx"
   _qf="$(count_files "$T_PATH_FAILED")"
   if [ "$_qf" = "0" ]; then
@@ -3015,7 +2913,6 @@ _rc=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --move-failed-to) _failto="$2"; shift 2; continue ;;
-    --class) printf '%s\n' "$2" >>"$_d/ocr.class"; shift 2; continue ;;
     -*) shift; continue ;;
   esac
   _f="$1"; shift
@@ -3074,33 +2971,6 @@ _EOSTUB_
 
 # A PDF that really parses -- settle's third check runs pdfinfo, and a
 # hand-waved "%PDF" header does NOT satisfy it (it needs a valid xref).
-# A one-page PDF carrying an actual image, so pdfimages can read a resolution
-# from it: $2 x $3 pixels on a $4 x $5 point page -- dpi = px / (points/72).
-t_pdf_img() { # $1 = file, $2 = px_w, $3 = px_h, $4 = pt_w, $5 = pt_h
-  /usr/bin/python3 - "$1" "$2" "$3" "$4" "$5" <<'_EOIMG_'
-import sys, zlib
-path, pw, ph, tw, th = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
-img = zlib.compress(bytes(pw * ph))          # a grey page, compresses to nothing
-objs = [
-  b"<< /Type /Catalog /Pages 2 0 R >>",
-  b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-  ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>" % (tw, th)).encode(),
-  ("<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length %d >>\nstream\n" % (pw, ph, len(img))).encode() + img + b"\nendstream",
-  None,
-]
-content = ("q %d 0 0 %d 0 0 cm /Im0 Do Q" % (tw, th)).encode()
-objs[4] = ("<< /Length %d >>\nstream\n" % len(content)).encode() + content + b"\nendstream"
-out = b"%PDF-1.4\n"; offs = []
-for i, o in enumerate(objs, 1):
-    offs.append(len(out)); out += b"%d 0 obj\n" % i + o + b"\nendobj\n"
-x = len(out)
-out += b"xref\n0 %d\n" % (len(objs) + 1) + b"0000000000 65535 f \n"
-for o in offs: out += b"%010d 00000 n \n" % o
-out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, x)
-open(path, "wb").write(out)
-_EOIMG_
-}
-
 t_pdf() {
   /usr/bin/python3 - "$1" <<'_EOPDF_'
 import sys
@@ -3402,44 +3272,6 @@ startxref
 }
 
 # ---- batches are bounded by PAGES, and pictures are valid input ----------
-# --- the resolution class: dpi decides, and a batch never mixes classes
-t_resolution_class() {
-  _rc="$T_TMP/resclass"; mkdir -p "$_rc"
-  t_pdf_img "$_rc/dpi600.pdf" 600 600 72 72     # 600 px on a 1 inch page
-  t_pdf_img "$_rc/dpi300.pdf" 300 300 72 72     # exactly 300 -- the boundary
-  t_pdf     "$_rc/noimage.pdf"                  # nothing to read a dpi from
-  # c_pdfinfo="" in each subshell: a real run starts with it UNSET, and the
-  # classifier has to resolve it itself. Without that the test would pass only
-  # because an earlier test in this same process had already resolved it --
-  # and a classifier that cannot find pdfimages calls every document std-res.
-  _c600="$(  c_pdfinfo=""; ocr_class_of "$_rc/dpi600.pdf" )"
-  _c300="$(  c_pdfinfo=""; ocr_class_of "$_rc/dpi300.pdf" )"
-  _cnone="$( c_pdfinfo=""; ocr_class_of "$_rc/noimage.pdf" )"
-  if [ "$_c600" = "high-res" ]; then t_ok "class: 600 dpi is high-res"
-  else t_bad "class: 600 dpi is high-res" "got '$_c600'"; fi
-  if [ "$_c300" = "std-res" ]; then t_ok "class: exactly 300 dpi stays std-res -- it loses nothing there"
-  else t_bad "class: exactly 300 dpi stays std-res -- it loses nothing there" "got '$_c300'"; fi
-  if [ "$_cnone" = "std-res" ]; then t_ok "class: a file with no readable resolution stays std-res"
-  else t_bad "class: a file with no readable resolution stays std-res" "got '$_cnone'"; fi
-  # pixels only when there is no dpi to read
-  _cpx="$( OCR_HIGH_RES_ABOVE_PX=100; ocr_class_of "$_rc/noimage.pdf" )"
-  if [ "$_cpx" = "std-res" ]; then t_ok "class: no pixels either -- still std-res, never a guess"
-  else t_bad "class: no pixels either -- still std-res, never a guess" "got '$_cpx'"; fi
-
-  # and the batcher must SPLIT them: one call per class, never mixed
-  _d="$T_TMP/resbatch"; t_world "$_d"
-  t_pdf_img "$_d/drop/hi.pdf"  600 600 72 72
-  t_pdf_img "$_d/drop/lo.pdf"  300 300 72 72
-  "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null
-  _cls="$(sort -u "$_d/ocr.class" 2>/dev/null | tr '\n' ' ')"
-  _n="$(awk 'END{print NR+0}' "$_d/ocr.class" 2>/dev/null)"
-  case "$_cls:$_n" in
-    "high-res std-res :2"|"std-res high-res :2")
-      t_ok "class: a 600 dpi and a 300 dpi document become TWO calls, one per class";;
-    *) t_bad "class: a 600 dpi and a 300 dpi document become TWO calls, one per class" "classes='$_cls' calls=$_n";;
-  esac
-}
-
 t_batching() {
   _d="$T_TMP/batching"; t_world "$_d"
   # cap 2 pages: three 1-page documents must arrive as three separate calls
@@ -4014,7 +3846,6 @@ do_run_tests() {
   t_deep_check
   t_cleanup
   t_batching
-  t_resolution_class
   t_picture_input
   t_types_agree
   t_status_order
