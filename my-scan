@@ -11,11 +11,11 @@
 # 091 == highest used errCode
 
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="01005cc"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="db108ae"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-20-g01005cc"
+SCRIPT_RELEASE="v1.0-21-gdb108ae"
 
 US="${0##*/}"
 
@@ -1294,7 +1294,18 @@ pending_files() {
 file_ocred_results() { # $1 = newline-separated staged paths
   while IFS= read -r _fr_f; do
     [ -z "$_fr_f" ] && continue
-    [ -e "$_fr_f" ] || continue                    # my-ocr moved it out
+    # my-ocr moved it out of the queue, so it was NOT OCRed. Skipping it
+    # silently is how a run in which every document failed still reported
+    # "0 failed": the file is simply no longer there to be counted.
+    if [ ! -e "$_fr_f" ]; then
+      FAILED_CNT=$(( FAILED_CNT + 1 ))
+      if [ -e "$T_PATH_FAILED/${_fr_f##*/}" ]; then
+        pe "  >  NOT OCRed: '${_fr_f##*/}' -- now in '$T_PATH_FAILED'"
+      else
+        pe "  >  NOT OCRed: '${_fr_f##*/}' -- gone from the queue, and not in '$T_PATH_FAILED' either"
+      fi
+      continue
+    fi
     _fr_final="$T_PATH_DONE/${_fr_f##*/}"
     if [ -e "$_fr_final" ]; then
       _fr_final="$T_PATH_DONE/$(date +%Y-%m-%d_%H%M.%S)___${_fr_f##*/}"
@@ -1671,6 +1682,14 @@ _EOPI_
   printf "%s  > %4d filed without OCR.\n"       "$_pfx" "$IGNORED_CNT"
   printf "%s  > %4d failed (of which %d wrong file type).\n" \
                                                 "$_pfx" "$FAILED_CNT" "$WRONG_FILETYPE_CNT"
+  # The three lines are a PARTITION of the first one. When they do not add up,
+  # documents went somewhere nobody accounted for, and a summary that hides
+  # that is worse than no summary -- so say it rather than print a total that
+  # quietly contradicts its own parts.
+  _sum=$(( FILES_OCRED_CNT + IGNORED_CNT + FAILED_CNT ))
+  [ "$_sum" -ne "$INP_FILES_CNT" ] && \
+    printf "%s  !!! these do not add up: %d accounted for, %d received -- %d document(s) unaccounted\n" \
+           "$_pfx" "$_sum" "$INP_FILES_CNT" "$(( INP_FILES_CNT - _sum ))"
   fi
 
   pe ""
@@ -3832,6 +3851,37 @@ t_counts_add_up() {
   esac
 }
 
+t_failed_are_counted() {
+  # A document my-ocr could not OCR is MOVED out of the queue, so the filing
+  # loop no longer finds it. That is how a run where all ten documents failed
+  # still printed "0 failed": nothing was there to count. The partition must
+  # hold -- received == OCRed + filed-without-OCR + failed.
+  _fc="$T_TMP/failedcount"; mkdir -p "$_fc/queue" "$_fc/done" "$_fc/failed"
+  _fc_was_done="$T_PATH_DONE"; _fc_was_failed="$T_PATH_FAILED"
+  _fc_was_ok="$FILES_OCRED_CNT"; _fc_was_bad="$FAILED_CNT"
+  T_PATH_DONE="$_fc/done"; T_PATH_FAILED="$_fc/failed"
+  FILES_OCRED_CNT=0; FAILED_CNT=0
+  t_pdf "$_fc/queue/ok.pdf"                        # survived -> OCRed and filed
+  t_pdf "$_fc/failed/bad.pdf"                      # my-ocr moved it here
+  file_ocred_results "$_fc/queue/ok.pdf$NL$_fc/queue/bad.pdf" >/dev/null 2>&1
+  if [ "$FILES_OCRED_CNT" = "1" ] && [ "$FAILED_CNT" = "1" ]; then
+    t_ok "counts: a document my-ocr moved to FAILED is counted as failed (1 ok / 1 failed)"
+  else
+    t_bad "counts: a document my-ocr moved to FAILED is counted as failed" \
+          "ocred=$FILES_OCRED_CNT failed=$FAILED_CNT"
+  fi
+  # one that vanished WITHOUT reaching the failed folder must still be counted
+  FILES_OCRED_CNT=0; FAILED_CNT=0
+  file_ocred_results "$_fc/queue/vanished.pdf" >/dev/null 2>&1
+  if [ "$FAILED_CNT" = "1" ]; then
+    t_ok "counts: a document that vanished from the queue is counted too"
+  else
+    t_bad "counts: a document that vanished from the queue is counted too" "failed=$FAILED_CNT"
+  fi
+  T_PATH_DONE="$_fc_was_done"; T_PATH_FAILED="$_fc_was_failed"
+  FILES_OCRED_CNT="$_fc_was_ok"; FAILED_CNT="$_fc_was_bad"
+}
+
 do_run_tests() {
   _p "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-scan.tests.XXXXXX)" || { _p "mktemp failed"; return 1; }
@@ -3857,6 +3907,7 @@ do_run_tests() {
   t_opt_arg_not_subcommand
   t_quiet
   t_counts_add_up
+  t_failed_are_counted
   t_dry_run
   t_config_keys
   t_qpdf_autodetect
