@@ -11,11 +11,11 @@
 # 091 == highest used errCode
 
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="a9710d6"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="0b79038"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-22-ga9710d6"
+SCRIPT_RELEASE="v1.0-23-g0b79038"
 
 US="${0##*/}"
 
@@ -407,6 +407,12 @@ STAGE_LOCK_TIMEOUT=300
 #   0 or empty = no limit (one call for everything, the old behaviour)
 OCR_BATCH_MAX_PAGES=10
 
+# What a document that went through the OCR says in its PDF 'Producer'. It is
+# the only proof my-scan accepts before filing a document as done; one without
+# it stays in the queue for the next run. Must match my-ocr's own
+# OCRAPP_PRODUCER_TAG -- that is how my-ocr recognises its output, too.
+OCR_PRODUCER_TAG="FineReader"
+
 # Counting pages costs a pdfinfo per document (~25ms). Worth it for a queue,
 # not for a backlog: above this many files 'status' reports documents only and
 # leaves the page count to -V.
@@ -519,8 +525,10 @@ validate_config() {
   # matches nothing, and every dotfile the FTP server drops (.ftpquota) counts
   # as a document waiting to be OCRed. A silently wrong count is worse than a
   # refusal to start, because it is believed.
+  # OCR_PRODUCER_TAG likewise: empty, the pattern that proves a document was
+  # OCRed matches EVERY document, and an untouched original is filed as done.
   for _k in OCR_QUEUE_PATH T_PATH_DONE T_PATH_FAILED SETTLE_WRITER_PROCS MY_OCR \
-           IGNORE_FILENAME_PATTERNS; do
+           IGNORE_FILENAME_PATTERNS OCR_PRODUCER_TAG; do
     # c_lsof is deliberately NOT required: empty means "autodetect", which is
     # how it works across OSes.
     eval "_v=\$$_k"
@@ -1289,9 +1297,14 @@ pending_files() {
 }
 
 # my-ocr replaces each original IN PLACE on success and moves what it could not
-# OCR to T_PATH_FAILED. So whatever is still in the list now is an OCRed file,
-# ready to be filed. Shared by 'process' and 'process --retry' so the two
-# cannot drift apart.
+# OCR to T_PATH_FAILED. What is still in the list is therefore a CANDIDATE for
+# filing -- never proof: when my-ocr refuses to start at all (stale state left
+# by a killed run), every original is still in the list, untouched, and filing
+# "what is left" put three documents that were never OCRed into the done folder
+# as if they had been. So a document is filed only when it carries the OCR
+# application's mark (OCR_PRODUCER_TAG in its PDF Producer), which is exactly
+# how my-ocr itself recognises its output. Shared by 'process' and 'process
+# --retry' so the two cannot drift apart.
 # The '_fr_' prefix is not decoration: this runs INSIDE ocr_in_chunks' own
 # read loop, and a shared variable name here silently ate a document from the
 # next chunk -- the loop appended a value this function had overwritten.
@@ -1310,6 +1323,16 @@ file_ocred_results() { # $1 = newline-separated staged paths
       fi
       continue
     fi
+    # Not marked = never went through the OCR. It stays in the queue, where the
+    # next run picks it up again: the document is fine, the run was not.
+    _fr_prod="$("$c_pdfinfo" "$_fr_f" 2>/dev/null | awk -F': *' '/^Producer:/{print $2; exit}')"
+    case "$_fr_prod" in
+      *"$OCR_PRODUCER_TAG"*) ;;
+      *)
+        FAILED_CNT=$(( FAILED_CNT + 1 ))
+        pe "  >  NOT OCRed: '${_fr_f##*/}' came back without the OCR mark [Producer='$_fr_prod'] -- left in the queue for the next run"
+        continue ;;
+    esac
     _fr_final="$T_PATH_DONE/${_fr_f##*/}"
     if [ -e "$_fr_final" ]; then
       _fr_final="$T_PATH_DONE/$(date +%Y-%m-%d_%H%M.%S)___${_fr_f##*/}"
@@ -2945,12 +2968,14 @@ while [ $# -gt 0 ]; do
     *BOOM*)                              # a file the OCR cannot handle
       _rc=1
       [ -n "$_failto" ] && { mkdir -p "$_failto"; mv "$_f" "$_failto/"; } ;;
-    *) printf 'OCRED\n' >>"$_f" ;;       # in place, like the real my-ocr
+    *) /usr/bin/python3 "$_d/mkpdf.py" "$_f" FineReader ;;  # in place, and MARKED, like the real my-ocr
   esac
 done
 exit $_rc
 _EOSTUB_
   chmod +x "$_tw/my-ocr.stub"
+  # the stub marks what it "OCRs" with the same generator the tests use
+  t_pdf "$_tw/.mkpdf-probe.pdf" && cp "$T_MKPDF_PY" "$_tw/mkpdf.py" && rm -f "$_tw/.mkpdf-probe.pdf"
   # stub my-notify: the suite must never pop a notification or send a real
   # mail. Records each call's arguments, one per line, and a '---' after them;
   # exits with the number in notify.rc (default 0).
@@ -2994,22 +3019,36 @@ _EOSTUB_
 
 # A PDF that really parses -- settle's third check runs pdfinfo, and a
 # hand-waved "%PDF" header does NOT satisfy it (it needs a valid xref).
+# $2 = optional PDF Producer: "FineReader" makes it look OCRed, as the stub
+# my-ocr does to what it "OCRs". The generator is written out once as a file so
+# the stub, a separate script, uses the very same one.
+T_MKPDF_PY=""
 t_pdf() {
-  /usr/bin/python3 - "$1" <<'_EOPDF_'
+  if [ -z "$T_MKPDF_PY" ] || [ ! -f "$T_MKPDF_PY" ]; then
+    T_MKPDF_PY="$(mktemp "${T_TMP:-/tmp}/mkpdf.XXXXXX")" || return 1
+    cat >"$T_MKPDF_PY" <<'_EOPDF_'
 import sys
+prod = sys.argv[2] if len(sys.argv) > 2 else ""
 objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>"]
+if prod:
+    objs.append(b"<< /Producer (" + prod.encode() + b") >>")
 out = b"%PDF-1.4\n"; offs = []
 for i, o in enumerate(objs, 1):
     offs.append(len(out)); out += b"%d 0 obj\n" % i + o + b"\nendobj\n"
+if prod:
+    out += b"%OCRED\n"            # a plain marker the stage-4 test greps for
 x = len(out)
 out += b"xref\n0 %d\n" % (len(objs) + 1) + b"0000000000 65535 f \n"
 for o in offs:
     out += b"%010d 00000 n \n" % o
-out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, x)
+info = b" /Info 4 0 R" if prod else b""
+out += b"trailer\n<< /Size %d /Root 1 0 R%s >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, info, x)
 open(sys.argv[1], "wb").write(out)
 _EOPDF_
+  fi
+  /usr/bin/python3 "$T_MKPDF_PY" "$@"
 }
 
 # ---- STAGE 1: input collection -------------------------------------------
@@ -3635,6 +3674,15 @@ t_config_keys() {
     *) t_bad "a config missing IGNORE_FILENAME_PATTERNS is refused, and the key is named" \
              "$(printf '%s' "$_o" | tail -n 1)";;
   esac
+  # an OLD config lacks OCR_PRODUCER_TAG; unset, the proof of OCR matches
+  # everything -- so it must be refused, never run on
+  grep -v '^OCR_PRODUCER_TAG=' "$T_CONF" >"$_d/conf.noprod"
+  _o="$("$0" --config "$_d/conf.noprod" status 2>&1 </dev/null)"
+  case "$_o" in
+    *OCR_PRODUCER_TAG*) t_ok "a config missing OCR_PRODUCER_TAG is refused, and the key is named";;
+    *) t_bad "a config missing OCR_PRODUCER_TAG is refused, and the key is named" \
+             "$(printf '%s' "$_o" | tail -n 1)";;
+  esac
 
   : >"$_d/drop/.ftpquota"
   t_pdf "$_d/drop/real.pdf"
@@ -3862,10 +3910,25 @@ t_failed_are_counted() {
   # hold -- received == OCRed + filed-without-OCR + failed.
   _fc="$T_TMP/failedcount"; mkdir -p "$_fc/queue" "$_fc/done" "$_fc/failed"
   _fc_was_done="$T_PATH_DONE"; _fc_was_failed="$T_PATH_FAILED"
-  _fc_was_ok="$FILES_OCRED_CNT"; _fc_was_bad="$FAILED_CNT"
+  _fc_was_ok="$FILES_OCRED_CNT"; _fc_was_bad="$FAILED_CNT"; _fc_was_tag="$OCR_PRODUCER_TAG"
   T_PATH_DONE="$_fc/done"; T_PATH_FAILED="$_fc/failed"
+  # set here because the suite loads no config; an EMPTY tag is refused at
+  # startup by validate_config (see t_config_keys), never reaches this code
+  OCR_PRODUCER_TAG="FineReader"
   FILES_OCRED_CNT=0; FAILED_CNT=0
-  t_pdf "$_fc/queue/ok.pdf"                        # survived -> OCRed and filed
+  find_pdfinfo >/dev/null 2>&1
+  # THE PRODUCTION FAILURE FIRST: my-ocr refused to start, so the original is
+  # still in the list, untouched. It must NOT be filed as done.
+  t_pdf "$_fc/queue/untouched.pdf"                 # no OCR mark at all
+  file_ocred_results "$_fc/queue/untouched.pdf" >/dev/null 2>&1
+  if [ -f "$_fc/queue/untouched.pdf" ] && [ -z "$(ls "$_fc/done")" ] && [ "$FAILED_CNT" = 1 ]; then
+    t_ok "counts: an original my-ocr never touched stays in the queue, counted failed, NOT filed"
+  else
+    t_bad "counts: an original my-ocr never touched stays in the queue, counted failed, NOT filed" \
+          "done holds $(find "$_fc/done" -type f | wc -l | tr -d ' ') file(s), queue=$([ -f "$_fc/queue/untouched.pdf" ] && echo yes || echo no), failed=$FAILED_CNT"
+  fi
+  rm -f "$_fc/queue/untouched.pdf" "$_fc/done/"*; FILES_OCRED_CNT=0; FAILED_CNT=0
+  t_pdf "$_fc/queue/ok.pdf" FineReader             # marked -> OCRed and filed
   t_pdf "$_fc/failed/bad.pdf"                      # my-ocr moved it here
   file_ocred_results "$_fc/queue/ok.pdf$NL$_fc/queue/bad.pdf" >/dev/null 2>&1
   if [ "$FILES_OCRED_CNT" = "1" ] && [ "$FAILED_CNT" = "1" ]; then
@@ -3883,7 +3946,7 @@ t_failed_are_counted() {
     t_bad "counts: a document that vanished from the queue is counted too" "failed=$FAILED_CNT"
   fi
   T_PATH_DONE="$_fc_was_done"; T_PATH_FAILED="$_fc_was_failed"
-  FILES_OCRED_CNT="$_fc_was_ok"; FAILED_CNT="$_fc_was_bad"
+  FILES_OCRED_CNT="$_fc_was_ok"; FAILED_CNT="$_fc_was_bad"; OCR_PRODUCER_TAG="$_fc_was_tag"
 }
 
 do_run_tests() {
