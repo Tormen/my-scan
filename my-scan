@@ -11,11 +11,11 @@
 # 091 == highest used errCode
 
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="db108ae"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="a9710d6"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-21-gdb108ae"
+SCRIPT_RELEASE="v1.0-22-ga9710d6"
 
 US="${0##*/}"
 
@@ -400,8 +400,12 @@ STAGE_LOCK_TIMEOUT=300
 # anything else -- a CLI 'my-ocr <file>', a scan that just arrived -- waits for
 # its turn. Smaller means a shorter wait and more FineReader round trips; each
 # round trip costs ~25s of fixed overhead whatever the page count.
+#
+# 10, not 25: a 25-page batch of ordinary scans keeps FineReader busy for a
+# good half hour (measured on the scan host, MRC at image quality 2), and everything in
+# it fails together and is re-fed together when anything goes wrong.
 #   0 or empty = no limit (one call for everything, the old behaviour)
-OCR_BATCH_MAX_PAGES=25
+OCR_BATCH_MAX_PAGES=10
 
 # Counting pages costs a pdfinfo per document (~25ms). Worth it for a queue,
 # not for a backlog: above this many files 'status' reports documents only and
