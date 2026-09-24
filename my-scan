@@ -11,11 +11,11 @@
 # 091 == highest used errCode
 
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="0b79038"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="61def22"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-23-g0b79038"
+SCRIPT_RELEASE="v1.0-24-g61def22"
 
 US="${0##*/}"
 
@@ -3215,6 +3215,18 @@ t_workflow() {
     t_ok "workflow: it records the folder it serves"
   else
     t_bad "workflow: it records the folder it serves" "empty -> Automator shows 'Choose folder' and nothing arrives"
+  fi
+  # 'setup go' just attached a REAL Folder Action to this test's temporary drop
+  # folder. Left there, it points at nothing once the suite has removed the
+  # folder -- one was found on the scan host, attached to a /tmp path long gone. So the
+  # suite undoes it with the tool's own inverse, and checks that it did.
+  "$0" --config "$T_CONF" uninstall go >/dev/null 2>&1 </dev/null
+  _fa_left="$(/usr/bin/osascript -e 'tell application "System Events" to get path of every folder action' 2>/dev/null \
+              | tr ',' '\n' | grep -F "${T_TMP##*/}/wflow/drop")"
+  if [ -z "$_fa_left" ]; then
+    t_ok "workflow: uninstall detaches it again -- nothing is left attached to the test's folder"
+  else
+    t_bad "workflow: uninstall detaches it again -- nothing is left attached to the test's folder" "still attached: $_fa_left"
   fi
 }
 
