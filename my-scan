@@ -8,14 +8,18 @@
 #   my-scan-processor-macos                 -> 'process' (OCR now goes to my-ocr)
 #   my-scan-processor-macos___wait-for-ocr  -> 'watch'   (OCR deblock watchdog)
 #
-# 091 == highest used errCode
+# 092 == highest used errCode
 
 SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="61def22"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="90e0fd7"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-24-g61def22"
+SCRIPT_RELEASE="v1.0-25-g90e0fd7"
+# The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
+# the amend replaces it -- so no other clone has it; its parent is always
+# there, and that is what proves a repository is this tool's own.
+SCRIPT_PARENT="ffbbfb0"
 
 US="${0##*/}"
 
@@ -590,10 +594,13 @@ do_version() {
   _vd="$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)"
   # describe answers about WHERE this file sits, not about what it is: a copy
   # dropped in a foreign repo gets THAT repo's tags (/LINKS/global is one, and
-  # it holds the copies update-LINKS promotes). The stamped commit is the
-  # proof -- a repo that does not have it is not this tool's repo.
-  if [ -n "$_vd" ] && [ -n "$SCRIPT_COMMIT" ] \
-     && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
+  # it holds the copies update-LINKS promotes). The stamped PARENT is the
+  # proof -- a repo that does not have it is not this tool's repo. Not
+  # SCRIPT_COMMIT: that one only ever existed in the clone that stamped, so
+  # every other checkout of the real repo was taken for a foreign one.
+  _vproof="${SCRIPT_PARENT:-$SCRIPT_COMMIT}"
+  if [ -n "$_vd" ] && [ -n "$_vproof" ] \
+     && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${_vproof}^{commit}" 2>/dev/null; then
     _vd=""
   fi
   # The stamp is a PAIR, written together: without SCRIPT_COMMIT there is no
@@ -648,12 +655,16 @@ do_stamp_version() {
 
   # git's own spelling, kept verbatim so it can be pasted back into git
   _desc="$(git -c safe.directory='*' -C "$_dir" describe --tags --long 2>/dev/null)"
+  _par="$(git -C "$_dir" rev-parse --short HEAD~1 2>/dev/null)"   # "" for a first commit
   _tmp="$0.stamp.$$"
   sed -e "s|^SCRIPT_COMMIT=\".*\"|SCRIPT_COMMIT=\"$_sha\"|" \
-      -e "s|^SCRIPT_RELEASE=\".*\"|SCRIPT_RELEASE=\"$_desc\"|" "$0" >"$_tmp" \
+      -e "s|^SCRIPT_RELEASE=\".*\"|SCRIPT_RELEASE=\"$_desc\"|" \
+      -e "s|^SCRIPT_PARENT=\".*\"|SCRIPT_PARENT=\"$_par\"|" "$0" >"$_tmp" \
     || { rm -f "$_tmp"; err 010 "FAILED to rewrite SCRIPT_COMMIT."; }
   grep -q "^SCRIPT_COMMIT=\"$_sha\"" "$_tmp" \
     || { rm -f "$_tmp"; err 011 "SCRIPT_COMMIT line not found -- refusing to install."; }
+  grep -q "^SCRIPT_PARENT=\"$_par\"" "$_tmp" \
+    || { rm -f "$_tmp"; err 092 "SCRIPT_PARENT line not found -- refusing to install."; }
 
   _mode="$(/usr/bin/stat -f '%Lp' "$0")" || _mode=750
   if ! { chmod "$_mode" "$_tmp" && mv -f "$_tmp" "$0"; }; then
@@ -3961,6 +3972,43 @@ t_failed_are_counted() {
   FILES_OCRED_CNT="$_fc_was_ok"; FAILED_CNT="$_fc_was_bad"; OCR_PRODUCER_TAG="$_fc_was_tag"
 }
 
+# --version in ANOTHER clone of this tool's repo. The proof that a repository is
+# the tool's own was the stamped SCRIPT_COMMIT -- a commit the amend replaces and
+# that is therefore never pushed. So every checkout but the one that stamped
+# (the scan host's, pulled from GitHub) was taken for a foreign repo and fell
+# back to the stamp. The proof is the stamped PARENT now. And the case the proof
+# exists for must still hold: a copy inside a foreign repo reports NOT its tags.
+t_version_clone() {
+  _vc="$T_TMP/vclone"; rm -rf "$_vc"; mkdir -p "$_vc/src" "$_vc/foreign"
+  cp "$0" "$_vc/src/$US"
+  (
+    cd "$_vc/src" && git init -q && git config user.email t@example.invalid \
+      && git config user.name t && git add -- "$US" && git commit -qm one \
+      && git tag v1.0 && echo "# two" >>"$US" && git commit -qam two \
+      && "./$US" stamp-version go >/dev/null 2>&1
+  ) || { t_bad "--version in another clone: set-up" "could not build the test repo"; return; }
+  # --no-local: a clone from a PATH copies the object store wholesale, the
+  # unpushed pre-amend commit included -- and then the old proof passed too.
+  # A clone over a transport gets only what is reachable, as one from GitHub.
+  git clone -q --no-local "$_vc/src" "$_vc/clone" 2>/dev/null
+  _vc_head="$(git -C "$_vc/clone" rev-parse --short HEAD)"
+  _vc_o="$("$_vc/clone/$US" --version 2>&1)"
+  case "$_vc_o" in
+    *"v1.0-1-g$_vc_head"*) t_ok "--version in another clone names git's HEAD ($_vc_head), not the stamp";;
+    *) t_bad "--version in another clone names git's HEAD ($_vc_head), not the stamp" "got: $_vc_o";;
+  esac
+  (
+    cd "$_vc/foreign" && git init -q && git config user.email t@example.invalid \
+      && git config user.name t && echo x >x && git add x && git commit -qm x \
+      && git tag v9.9 && cp "$_vc/src/$US" . && git add -- "$US" && git commit -qm copy
+  ) >/dev/null 2>&1
+  _vc_o="$("$_vc/foreign/$US" --version 2>&1)"
+  case "$_vc_o" in
+    *v9.9*) t_bad "--version in a FOREIGN repo does not report that repo's tag" "got: $_vc_o";;
+    *) t_ok "--version in a FOREIGN repo does not report that repo's tag";;
+  esac
+}
+
 do_run_tests() {
   _p "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-scan.tests.XXXXXX)" || { _p "mktemp failed"; return 1; }
@@ -3992,6 +4040,7 @@ do_run_tests() {
   t_qpdf_autodetect
   t_pdfinfo_autodetect
   t_settle_giveup
+  t_version_clone
   t_my_ocr_suite
   rm -rf "$T_TMP"
   _p "  ----"
