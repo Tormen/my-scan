@@ -10,16 +10,16 @@
 #
 # 092 == highest used errCode
 
-SCRIPT_VERSION="v1.0"
-SCRIPT_COMMIT="90e0fd7"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_VERSION="v1.1"
+SCRIPT_COMMIT="5b3fdc4"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-25-g90e0fd7"
+SCRIPT_RELEASE="v1.0-26-g5b3fdc4"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="ffbbfb0"
+SCRIPT_PARENT="15c29eb"
 
 US="${0##*/}"
 
