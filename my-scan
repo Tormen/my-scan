@@ -11,15 +11,15 @@
 # 092 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="5b3fdc4"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="faa4a24"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.0-26-g5b3fdc4"
+SCRIPT_RELEASE="v1.1-1-gfaa4a24"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="15c29eb"
+SCRIPT_PARENT="b1e294d"
 
 US="${0##*/}"
 
@@ -1747,9 +1747,22 @@ _EOPI_
 
 # Only 'process' feeds this now, and Automator always pipes: the argv branch
 # left with the 'settle' subcommand.
+# Names given directly -- the Folder Action passes each new file this way --
+# go through the same IGNORE_FILENAME_PATTERNS as a folder walk. They did not:
+# the FTP server writes every upload under a temporary '.pureftpd-upload.<id>'
+# first, the Folder Action fired for that name too, and by the time it was
+# looked at it had been renamed -- one "ERROR 021 ... Could not read the mtime"
+# per scan in the log.
 collect_inputs() {
   [ -t 0 ] && return 0
-  cat
+  while IFS= read -r _ci_f; do
+    [ -n "$_ci_f" ] || continue
+    if is_ignored_name "$_ci_f"; then
+      dbg "ignored (IGNORE_FILENAME_PATTERNS): '$_ci_f'"
+    else
+      printf '%s\n' "$_ci_f"
+    fi
+  done
 }
 
 
@@ -4009,6 +4022,18 @@ t_version_clone() {
   esac
 }
 
+# A name handed over directly is ignored by the same patterns as a folder walk.
+t_set_ignore() { IGNORE_FILENAME_PATTERNS="$1"; } # INSIDE a subshell only
+t_ignored_inputs() {
+  _ii_o="$( t_set_ignore '.* *.part'
+            printf '%s\n' "/x/.pureftpd-upload.6ab677d0.52da" "/x/scan20260925_143200.pdf" "/x/b.part" | collect_inputs )"
+  if [ "$_ii_o" = "/x/scan20260925_143200.pdf" ]; then
+    t_ok "inputs: a name given directly (the Folder Action's way) is filtered by IGNORE_FILENAME_PATTERNS"
+  else
+    t_bad "inputs: a name given directly (the Folder Action's way) is filtered by IGNORE_FILENAME_PATTERNS" "got: $(printf '%s' "$_ii_o" | tr '\n' ' ')"
+  fi
+}
+
 do_run_tests() {
   _p "$US --run-tests   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-scan.tests.XXXXXX)" || { _p "mktemp failed"; return 1; }
@@ -4041,6 +4066,7 @@ do_run_tests() {
   t_pdfinfo_autodetect
   t_settle_giveup
   t_version_clone
+  t_ignored_inputs
   t_my_ocr_suite
   rm -rf "$T_TMP"
   _p "  ----"
