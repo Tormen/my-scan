@@ -594,7 +594,7 @@ do_version() {
   _vd="$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)"
   # describe answers about WHERE this file sits, not about what it is: a copy
   # dropped in a foreign repo gets THAT repo's tags (/LINKS/global is one, and
-  # it holds the copies update-LINKS promotes). The stamped PARENT is the
+  # it holds the copies my-rollout promotes). The stamped PARENT is the
   # proof -- a repo that does not have it is not this tool's repo. Not
   # SCRIPT_COMMIT: that one only ever existed in the clone that stamped, so
   # every other checkout of the real repo was taken for a foreign one.
