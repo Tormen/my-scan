@@ -307,8 +307,17 @@ existing one, and lints it; attaches it to each `DROP_PATHS` folder through
 System Events — which mints the security-scoped bookmarks itself, so the
 `NSKeyedArchiver`-encoded preferences plist never has to be written by hand.
 
-It then reads the bindings back and prints what Folder Actions Setup should
-show, marking its own. If macOS refuses on Automation permission it names the
+Only what is not in place is changed. The workflow counts as in place when
+its command, shell and folder are the ones setup would write (not its bytes:
+each write mints new UUIDs). A binding counts as in place when the Folder
+Actions preferences already show it, read the way `status` reads them — no
+System Events call, so the dry run cannot hang on a consent dialog. Each item
+prints `OK` or what differs. The last line says
+`everything is in place -- nothing to change [0 changes]` or gives the number
+of changes, so a second `setup go` right after the first changes nothing.
+
+After an attach it reads the bindings back and prints what Folder Actions
+Setup should show, marking its own. If macOS refuses on Automation permission it names the
 setting to change and gives the manual route.
 
 `uninstall` removes **only what setup put in**: its own Folder Action script

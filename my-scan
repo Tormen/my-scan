@@ -11,15 +11,15 @@
 # 092 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="faa4a24"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="f931ef5"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.1-1-gfaa4a24"
+SCRIPT_RELEASE="v1.1-4-gf931ef5"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="b1e294d"
+SCRIPT_PARENT="f80c14d"
 
 US="${0##*/}"
 
@@ -1946,15 +1946,23 @@ running_pids() {
 }
 
 
+# The Folder Actions preferences, as of NOW, into file $1. Through 'defaults',
+# never the plist file: a binding System Events just made sits in cfprefsd and
+# reaches ~/Library/Preferences seconds later, so the file reads it as absent.
+fa_prefs_export() { # $1 = file to write
+  /usr/bin/defaults export com.apple.FolderActionsDispatcher "$1" 2>/dev/null
+}
+
 folder_action_state() {
-  _plist="$HOME/Library/Preferences/com.apple.FolderActionsDispatcher.plist"
-  [ -f "$_plist" ] || { _p "no folder-action preferences file"; return 1; }
-  _enabled="$(/usr/libexec/PlistBuddy -c "Print :folderActionsEnabled" "$_plist" 2>/dev/null)"
+  _fas_tmp="$(mktemp /tmp/my-scan.fa.XXXXXX)" || { _p "unknown (mktemp failed)"; return 1; }
+  fa_prefs_export "$_fas_tmp" || { rm -f "$_fas_tmp"; _p "no folder-action preferences"; return 1; }
+  _enabled="$(/usr/libexec/PlistBuddy -c "Print :folderActionsEnabled" "$_fas_tmp" 2>/dev/null)"
   [ -z "$_enabled" ] && _enabled="unknown"
   # the bindings are NSKeyedArchiver blobs; the folder and workflow names are
   # still readable as plain strings inside them
-  _names="$(strings "$_plist" 2>/dev/null \
+  _names="$(strings "$_fas_tmp" 2>/dev/null \
              | grep -E "^[A-Za-z0-9][A-Za-z0-9._+-]*\.workflow\$" | sort -u | xargs echo)"
+  rm -f "$_fas_tmp"
   _p "enabled=$_enabled workflows=${_names:-<none>}"
 }
 
@@ -2409,8 +2417,9 @@ $SETTLE_BACKUP_PATH"
       if [ -w "$_d" ]; then det "OK       $_d"
       else det "NOT WRITABLE by $(id -un): $_d  (owner $(/usr/bin/stat -f '%Su:%Sg mode %Lp' "$_d"))"; _fail=1; fi
     elif [ -n "$DRY_RUN" ]; then
-      det "WOULD CREATE  $_d"
+      det "WOULD CREATE  $_d"; SETUP_TODO=$(( SETUP_TODO + 1 ))
     else
+      SETUP_TODO=$(( SETUP_TODO + 1 ))
       if mkdir -p "$_d" 2>/dev/null; then det "CREATED  $_d"
       else det "CANNOT CREATE $_d -- its parent is not writable by $(id -un)"; _fail=1; fi
     fi
@@ -2420,9 +2429,88 @@ _EOSD_
   return $_fail
 }
 
-# The Automator document. Three steps, exactly as the hand-built workflow on
-# the live machine: shell -> OCR -> shell. The shell steps call THIS tool, so
+# The one command the workflow's step runs. setup writes it and compares the
+# installed workflow against it, from this one place.
+wf_command() {
+  # shellcheck disable=SC2016  # $a is the workflow shell's, not ours
+  printf 'while read a; do echo "$a"; done|%s process' "$WORKFLOW_MY_SCAN"
+}
+
+# Is the installed workflow the one setup would write? Compares what Automator
+# acts on -- folder-action type, the one step's command and shell, the folder
+# it serves -- never the bytes: every write mints fresh UUIDs. Prints the first
+# difference; returns 0 when there is none.
+workflow_current() { # $1 = workflow dir, $2 = the folder it should serve
+  _wc_doc="$1/Contents/document.wflow"
+  [ -f "$_wc_doc" ] || { _p "no $_wc_doc"; return 1; }
+  while IFS="$TAB" read -r _wc_f _wc_k _wc_want; do
+    _wc_have="$(/usr/bin/plutil -extract "$_wc_k" raw -o - "$1/Contents/$_wc_f" 2>/dev/null)"
+    [ "$_wc_have" = "$_wc_want" ] && continue
+    _p "$_wc_k is '$_wc_have', setup writes '$_wc_want'"
+    return 1
+  done <<_EOWC_
+Info.plist${TAB}AMFolderAction${TAB}AMAddingFolderItems
+document.wflow${TAB}actions${TAB}1
+document.wflow${TAB}actions.0.action.ActionParameters.COMMAND_STRING${TAB}$(wf_command)
+document.wflow${TAB}actions.0.action.ActionParameters.shell${TAB}$WORKFLOW_SHELL
+document.wflow${TAB}workflowMetaData.folderActionFolderPath${TAB}$2
+document.wflow${TAB}workflowMetaData.workflowTypeIdentifier${TAB}com.apple.Automator.folderAction
+_EOWC_
+  return 0
+}
+
+# Is WORKFLOW_NAME attached, and enabled, on folder $1? Read from the Folder
+# Actions dispatcher's preferences, as 'status' does -- never from System
+# Events, which can wait for ever on a consent dialog nobody sees (ssh). The
+# bindings are an NSKeyedArchiver blob; each folder action holds a bookmark
+# whose sandbox entry ends in the folder's RESOLVED path, lower-cased. Prints
+# what is missing; returns 0 attached, 1 not, 2 when it cannot tell.
+fa_bound() { # $1 = folder, $2 = preferences file (default: exported now)
+  _fab_tmp=""
+  _fab_prefs="$2"
+  if [ -z "$_fab_prefs" ]; then
+    _fab_tmp="$(mktemp /tmp/my-scan.fa.XXXXXX)" || { _p "mktemp failed"; return 2; }
+    _fab_prefs="$_fab_tmp"
+    if ! fa_prefs_export "$_fab_tmp"; then
+      rm -f "$_fab_tmp"; _p "no folder-action preferences -- nothing is attached anywhere"; return 1
+    fi
+  fi
+  MY_SCAN_FA_DIR="$(canon_dir "$1")" MY_SCAN_FA_WF="$WORKFLOW_NAME" \
+  /usr/bin/python3 -B - "$_fab_prefs" <<'_EOFA_'
+import os, plistlib, re, sys
+d, wf = os.environ["MY_SCAN_FA_DIR"], os.environ["MY_SCAN_FA_WF"]
+try:
+    top = plistlib.load(open(sys.argv[1], "rb"))
+    blob = top.get("folderActions")
+    objs = plistlib.loads(blob)["$objects"] if blob else []
+except Exception as e:
+    print("cannot read the folder-action preferences: %s" % e); sys.exit(2)
+get = lambda x: objs[x.data] if isinstance(x, plistlib.UID) else x
+if not top.get("folderActionsEnabled"):
+    print("Folder Actions are switched off"); sys.exit(1)
+for o in objs:
+    if not (isinstance(o, dict) and "scripts" in o and "bookmark" in o): continue
+    bm = get(o["bookmark"])
+    paths = [m.decode("utf-8", "replace") for m in re.findall(rb";(/[^;\x00-\x1f]+)", bm)] if isinstance(bm, bytes) else []
+    if d.lower() not in paths: continue
+    if not get(o.get("enabled")):
+        print("the folder action on '%s' is disabled" % d); sys.exit(1)
+    for s in map(get, get(o["scripts"]).get("NS.objects", [])):
+        if get(s.get("name")) == wf:
+            if get(s.get("enabled")): sys.exit(0)
+            print("'%s' is attached to '%s' but disabled" % (wf, d)); sys.exit(1)
+    print("'%s' has a folder action, but not '%s'" % (d, wf)); sys.exit(1)
+print("nothing is attached to '%s'" % d); sys.exit(1)
+_EOFA_
+  _fab_rc=$?
+  [ -n "$_fab_tmp" ] && rm -f "$_fab_tmp"
+  return "$_fab_rc"
+}
+
+# The Automator document: ONE Run Shell Script step that calls THIS tool, so
 # the settle/validate logic lives in the repo instead of inside the workflow.
+# Written only when the installed one differs (backed up first); a second
+# 'setup' right after the first finds it OK and touches nothing.
 setup_write_workflow() {
   _wf="$WORKFLOW_DIR/$WORKFLOW_NAME"
   msg2 "Automator workflow '$_wf'"
@@ -2439,6 +2527,19 @@ Its Run Shell Script step silently does nothing with any other shell -- no error
 nothing in any log. Use one of: /bin/zsh /bin/sh /bin/bash /bin/ksh /bin/csh /bin/tcsh." "-"
        return 1 ;;
   esac
+
+  # The workflow records WHICH folder it serves; one workflow per drop path is
+  # not supported here, so the first is the one it is written for.
+  _dp1=""; for _d in $DROP_PATHS; do _dp1="$_d"; break; done
+
+  if [ -d "$_wf" ]; then
+    if _wc="$(workflow_current "$_wf" "$_dp1")"; then
+      det "OK       one step, '$(wf_command)' (shell $WORKFLOW_SHELL)"
+      return 0
+    fi
+    det "differs: $_wc"
+  fi
+  SETUP_TODO=$(( SETUP_TODO + 1 ))
 
   if [ -d "$_wf" ]; then
     _bak="$_wf.bak-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -2479,16 +2580,13 @@ _EOIP_
 
   _doc="$_wf/Contents/document.wflow"
   _gerr="$(mktemp /tmp/my-scan.wflow.XXXXXX)" || return 1
-  # The workflow records WHICH folder it serves; one workflow per drop path is
-  # not supported here, so the first is the one it is written for.
-  _dp1=""; for _d in $DROP_PATHS; do _dp1="$_d"; break; done
-  MY_SCAN_BIN="$WORKFLOW_MY_SCAN" \
+  MY_SCAN_CMD="$(wf_command)" \
   MY_SCAN_DROP="$_dp1" \
   MY_SCAN_SHELL="$WORKFLOW_SHELL" \
   /usr/bin/python3 - "$_doc" 2>"$_gerr" <<'_EOPY_'
 import os, plistlib, sys, uuid
 
-BIN    = os.environ["MY_SCAN_BIN"]
+CMD    = os.environ["MY_SCAN_CMD"]
 DROP   = os.environ["MY_SCAN_DROP"]
 SHELL_ = os.environ["MY_SCAN_SHELL"]
 
@@ -2533,7 +2631,7 @@ doc = {
         # ONE step. my-ocr owns FineReader and its own Folder Action, so
         # Automator does not drive the OCR any more -- my-scan does, by
         # calling my-ocr, which blocks until its turn.
-        shell("while read a; do echo \"$a\"; done|%s process" % BIN, str(uuid.uuid4())),
+        shell(CMD, str(uuid.uuid4())),
     ],
     "connectors": {},
     "variables": [],
@@ -2685,11 +2783,20 @@ _EOSV_
 
 setup_attach() {
   msg2 "Folder Action bindings"
+  _attached=0
   for _dp in $DROP_PATHS; do
+    _fb="$(fa_bound "$_dp")"; _fbr=$?
+    if [ "$_fbr" -eq 0 ]; then
+      det "OK       '$WORKFLOW_NAME' on '$_dp'"
+      continue
+    fi
+    det "not attached: $_fb [$_fbr]"
+    SETUP_TODO=$(( SETUP_TODO + 1 ))
     if [ -n "$DRY_RUN" ]; then
       det "WOULD ATTACH '$WORKFLOW_NAME' to '$_dp'"
       continue
     fi
+    _attached=$(( _attached + 1 ))
     vrb "osascript -e 'tell application \"System Events\" ... attach $WORKFLOW_NAME to $_dp'"
     vdet "System Events owns the folder<->workflow bindings and mints the"
     vdet "security-scoped bookmarks itself; the preferences plist cannot be"
@@ -2742,6 +2849,7 @@ _EOAS_
   # Confirm, and tell them what they should SEE -- an attach that reports
   # success but did not stick is worse than one that admits it failed.
   [ -n "$DRY_RUN" ] && return 0
+  [ "$_attached" -eq 0 ] && return 0
   _bind="$(setup_verify_bindings)"
   if [ -z "$_bind" ]; then
     det "could not read the bindings back -- check Folder Actions Setup by hand"
@@ -2925,6 +3033,7 @@ so this would set it up for the wrong account." "-"
   fi
   det "config: $CONFIG_FILE"
 
+  SETUP_TODO=0   # what is (or would be) changed: dirs, workflow, bindings
   setup_preflight;       _pf=$?
   setup_dirs;            _sd=$?
   setup_write_workflow;  _sw=$?
@@ -2938,9 +3047,13 @@ so this would set it up for the wrong account." "-"
     det "fix the items marked MISSING / NOT WRITABLE above, then re-run"
   fi
 
-  if [ -n "$DRY_RUN" ]; then
-    echo
-    det "this was a dry run -- apply it with:  $US setup go"
+  echo
+  if [ "$SETUP_TODO" -eq 0 ]; then
+    det "everything is in place -- nothing to change [0 changes]"
+  elif [ -n "$DRY_RUN" ]; then
+    det "this was a dry run -- apply the $SETUP_TODO change(s) with:  $US setup go"
+  else
+    det "applied $SETUP_TODO change(s)"
   fi
 
   echo
@@ -3243,11 +3356,46 @@ rt_workflow() {
   else
     t_bad "workflow: it records the folder it serves" "empty -> Automator shows 'Choose folder' and nothing arrives"
   fi
+  # A second run right after the first must not rewrite the workflow: no backup
+  # appears, and the dry run calls it OK. (Only the workflow: System Events
+  # attaches a script by NAME from the standard Folder Actions folder, so the
+  # test's temporary WORKFLOW_DIR is never really attached -- the binding check
+  # is rt_fa_bound's, against preferences of the real shape.)
+  "$0" --config "$T_CONF" setup go >/dev/null 2>&1 </dev/null
+  _bk="$(find "$T_WFDIR" -maxdepth 1 -name 'my-scan.workflow.bak-*' 2>/dev/null | wc -l | tr -d ' ')"
+  _o="$("$0" --config "$T_CONF" setup 2>&1 </dev/null)"
+  _would="$(printf '%s\n' "$_o" | grep -c 'WOULD WRITE\|WOULD BACK UP')"
+  case "$_o" in
+    *"OK       one step"*)
+      if [ "$_bk" = "0" ] && [ "$_would" = "0" ]; then
+        t_ok "workflow: a second setup leaves it alone (0 backups, 0 WOULD WRITE)"
+      else
+        t_bad "workflow: a second setup leaves it alone" "$_bk backup(s), $_would WOULD line(s)"
+      fi ;;
+    *) t_bad "workflow: a second setup leaves it alone" \
+             "$(printf '%s\n' "$_o" | grep -E 'WOULD|differs' | head -n 2 | tr '\n' ' ')" ;;
+  esac
+  # ...and a workflow that runs something else is NOT in place
+  /usr/bin/plutil -replace actions.0.action.ActionParameters.COMMAND_STRING -string "true" "$_doc" 2>/dev/null
+  _o="$("$0" --config "$T_CONF" setup 2>&1 </dev/null)"
+  case "$_o" in
+    *"differs: actions.0.action.ActionParameters.COMMAND_STRING is 'true'"*"WOULD WRITE"*)
+      t_ok "workflow: a changed command is found, named, and would be rewritten";;
+    *) t_bad "workflow: a changed command is found, named, and would be rewritten" \
+             "$(printf '%s\n' "$_o" | grep -E 'OK +one step|differs' | head -n 1)";;
+  esac
   # 'setup go' just attached a REAL Folder Action to this test's temporary drop
   # folder. Left there, it points at nothing once the suite has removed the
   # folder -- one was found on the scan host, attached to a /tmp path long gone. So the
   # suite undoes it with the tool's own inverse, and checks that it did.
   "$0" --config "$T_CONF" uninstall go >/dev/null 2>&1 </dev/null
+  _o="$("$0" --config "$T_CONF" setup 2>&1 </dev/null)"
+  case "$_o" in
+    *"not attached:"*"WOULD ATTACH"*)
+      t_ok "workflow: once detached, setup sees it and would attach it again";;
+    *) t_bad "workflow: once detached, setup sees it and would attach it again" \
+             "$(printf '%s\n' "$_o" | grep -E "OK +'my-scan|not attached" | head -n 1)";;
+  esac
   _fa_left="$(/usr/bin/osascript -e 'tell application "System Events" to get path of every folder action' 2>/dev/null \
               | tr ',' '\n' | grep -F "${T_TMP##*/}/wflow/drop")"
   if [ -z "$_fa_left" ]; then
@@ -4037,6 +4185,53 @@ rt_ignored_inputs() {
   fi
 }
 
+# ---- is the workflow attached? read from preferences of the real shape -----
+# The fixture mirrors what the Folder Actions dispatcher stores (decoded from a
+# live machine): an NSKeyedArchiver blob, each folder action with a bookmark
+# whose sandbox entry ends in the folder's resolved path, LOWER-cased.
+rt_fa_bound() {
+  _fx="$T_TMP/fa.plist"
+  /usr/bin/python3 -B - "$_fx" <<'_EOFX_'
+import plistlib, sys
+U = plistlib.UID
+def bm(p): return b"book\x00;com.apple.app-sandbox.read-write;01;" + p.encode() + b"\x00\x00"
+objs = ["$null",
+  {"NS.objects": [U(2), U(8), U(12)]},                                    # 1 all
+  {"bookmark": U(3), "enabled": U(4), "name": U(5), "scripts": U(6)},     # 2 drop
+  bm("/nosuch/fa/scans"), True, "Scans",
+  {"NS.objects": [U(7)]},
+  {"bookmark": U(3), "enabled": U(4), "name": U(17)},                     # 7 our script
+  {"bookmark": U(9), "enabled": U(4), "name": U(10), "scripts": U(11)},   # 8 other folder
+  bm("/nosuch/fa/scans2"), "scans2",
+  {"NS.objects": [U(7)]},
+  {"bookmark": U(13), "enabled": U(4), "name": U(14), "scripts": U(15)},  # 12 foreign only
+  bm("/nosuch/fa/foreign"), "foreign",
+  {"NS.objects": [U(16)]},
+  {"bookmark": U(13), "enabled": U(4), "name": U(18)},                    # 16 foreign script
+  "my-scan.workflow", "other.workflow"]
+blob = plistlib.dumps({"$archiver": "NSKeyedArchiver", "$version": 100000,
+                       "$top": {"root": U(1)}, "$objects": objs}, fmt=plistlib.FMT_BINARY)
+for name, on in (("", True), (".off", False)):
+    with open(sys.argv[1] + name, "wb") as fh:
+        plistlib.dump({"folderActionsEnabled": on, "folderActions": blob}, fh)
+_EOFX_
+  WORKFLOW_NAME="my-scan.workflow"
+  # $1 folder, $2 prefs, $3 rc wanted, $4 text wanted, $5 title
+  _fb_case() {
+    _fbo="$(fa_bound "$1" "$2")"; _fbr=$?
+    case "$_fbr:$_fbo" in
+      "$3:"*"$4"*) t_ok "fa_bound: $5 [$_fbr]";;
+      *) t_bad "fa_bound: $5" "rc $_fbr, said '$_fbo'";;
+    esac
+  }
+  _fb_case /NoSuch/fa/Scans  "$_fx"     0 ""                        "attached and enabled -- the path compared case-blind"
+  _fb_case /nosuch/fa/scan   "$_fx"     1 "nothing is attached"     "a folder whose path is a PREFIX of a bound one is not bound"
+  _fb_case /nosuch/fa/other  "$_fx"     1 "nothing is attached"     "an unbound folder"
+  _fb_case /nosuch/fa/foreign "$_fx"    1 "but not 'my-scan.workflow'" "a folder carrying only another script"
+  _fb_case /nosuch/fa/scans  "$_fx.off" 1 "switched off"            "Folder Actions switched off"
+  _fb_case /nosuch/fa/scans  "$T_TMP/no-such.plist" 2 "cannot read"  "unreadable preferences: cannot tell, never 'attached'"
+}
+
 # A test left out of the run list never runs, silently -- so the list is checked.
 rt_run_list_complete() {
   _rt_def="$(grep -c '^rt_[a-z_]*() {$' "$0")"
@@ -4053,7 +4248,7 @@ rt_run_list_complete() {
 # whose name contains it. TAP-style: "1..N" first, then "ok K - name" /
 # "not ok K - name" as each test ends.
 _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
-  concurrent_process workflow partial_delivery deep_check cleanup batching
+  concurrent_process workflow fa_bound partial_delivery deep_check cleanup batching
   picture_input types_agree status_order retry listing_not_swallowed_by_log
   reset_delegates test_mail help_claims opt_arg_not_subcommand quiet
   counts_add_up failed_are_counted dry_run config_keys qpdf_autodetect
