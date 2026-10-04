@@ -2959,7 +2959,10 @@ so this would set it up for the wrong account." "-"
 # Every stage the pipeline actually has, exercised for real against temp dirs
 # and a STUB my-ocr -- no FineReader, no GUI, seconds not minutes. The stub is
 # what makes stage 4 testable at all: the real one needs a single-instance app.
+# The section is one brace group only so that the shellcheck directive covers it.
 
+# shellcheck disable=SC2329  # the rt_ tests are called by name from the run list, and the helpers from them
+{
 T_PASS=0; T_FAIL=0
 t_ok()  { T_PASS=$(( T_PASS + 1 )); printf '  ok    %s\n' "$1"; }
 t_bad() { T_FAIL=$(( T_FAIL + 1 )); printf '  FAIL  %s\n' "$1"
@@ -3076,7 +3079,7 @@ _EOPDF_
 }
 
 # ---- STAGE 1: input collection -------------------------------------------
-t_stage_inputs() {
+rt_stage_inputs() {
   _d="$T_TMP/inputs"; t_world "$_d"
   t_pdf "$_d/drop/a.pdf"; t_pdf "$_d/drop/b.pdf"
   _o="$("$0" --config "$T_CONF" process 2>&1 </dev/null)"
@@ -3099,7 +3102,7 @@ t_stage_inputs() {
 }
 
 # ---- STAGE 2: settle ------------------------------------------------------
-t_stage_settle() {
+rt_stage_settle() {
   _d="$T_TMP/settle"; t_world "$_d"
   # (a) a file that does not parse never settles
   printf 'not a pdf' >"$_d/drop/junk.pdf"
@@ -3125,7 +3128,7 @@ t_stage_settle() {
 }
 
 # ---- STAGE 3: staging (name + move) ---------------------------------------
-t_stage_staging() {
+rt_stage_staging() {
   _d="$T_TMP/staging"; t_world "$_d"
   t_pdf "$_d/drop/scan001.pdf"
   "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null
@@ -3150,7 +3153,7 @@ t_stage_staging() {
 }
 
 # ---- STAGE 4: the batch contract -----------------------------------------
-t_stage_batch() {
+rt_stage_batch() {
   _d="$T_TMP/batch"; t_world "$_d"
   for n in 1 2 3; do t_pdf "$_d/drop/s$n.pdf"; done
   "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null
@@ -3169,7 +3172,7 @@ t_stage_batch() {
 }
 
 # ---- STAGE 5: failure routing --------------------------------------------
-t_stage_failure() {
+rt_stage_failure() {
   _d="$T_TMP/fail"; t_world "$_d"
   t_pdf "$_d/drop/BOOM.pdf"
   "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null
@@ -3187,14 +3190,14 @@ t_stage_failure() {
 }
 
 # ---- concurrency: two 'process' runs must not both take the same file ----
-t_concurrent_process() {
+rt_concurrent_process() {
   _d="$T_TMP/conc"; t_world "$_d"
   for n in 1 2 3 4; do t_pdf "$_d/drop/c$n.pdf"; done
   "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null &
   _p1=$!
   "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null &
   _p2=$!
-  wait $_p1 2>/dev/null; wait $_p2 2>/dev/null
+  wait "$_p1" 2>/dev/null; wait "$_p2" 2>/dev/null
   # Count EVERY place a document can legitimately be. Counting only two of
   # them makes a file that is merely still queued look like a lost one.
   _done="$(find "$_d/done"   -name '*.pdf' -type f 2>/dev/null | wc -l | tr -d ' ')"
@@ -3217,7 +3220,7 @@ t_concurrent_process() {
 }
 
 # ---- the workflow Automator has to accept --------------------------------
-t_workflow() {
+rt_workflow() {
   _d="$T_TMP/wflow"; t_world "$_d"
   "$0" --config "$T_CONF" setup go >/dev/null 2>&1 </dev/null
   _doc="$T_WFDIR/my-scan.workflow/Contents/document.wflow"
@@ -3258,7 +3261,7 @@ t_workflow() {
 # Every truncated file found in the live FAILED folder was an exact multiple
 # of 4096 bytes with no %%EOF: copied while the FTP daemon was still writing.
 # These are the two shapes that failure takes.
-t_partial_delivery() {
+rt_partial_delivery() {
   _d="$T_TMP/partial"; t_world "$_d"
 
   # (a) zero bytes -- what a Folder Action sees the instant a file is created.
@@ -3297,7 +3300,7 @@ t_partial_delivery() {
 }
 
 # ---- discarding what holds no document ------------------------------------
-t_cleanup() {
+rt_cleanup() {
   _d="$T_TMP/cleanup"; t_world "$_d"
   : >"$_d/failed/2026-09-08_0101.01___nothing.pdf"                 # 0 bytes
   t_pdf "$_d/full.pdf"
@@ -3337,7 +3340,7 @@ t_cleanup() {
 # settle's parse test only proves pdfinfo can read the catalogue. A file whose
 # CONTENT was damaged in transit passes that and fails qpdf -- and OCRing it
 # wastes a run and puts a corrupt document in the queue.
-t_deep_check() {
+rt_deep_check() {
   if ! command -v qpdf >/dev/null 2>&1 && [ ! -x /opt/homebrew/bin/qpdf ]; then
     t_ok "deep check: skipped, no qpdf on this host"; return 0
   fi
@@ -3370,7 +3373,7 @@ startxref
 }
 
 # ---- batches are bounded by PAGES, and pictures are valid input ----------
-t_batching() {
+rt_batching() {
   _d="$T_TMP/batching"; t_world "$_d"
   # cap 2 pages: three 1-page documents must arrive as three separate calls
   sed -e 's|^OCR_BATCH_MAX_PAGES=.*|OCR_BATCH_MAX_PAGES=2|' "$T_CONF" >"$_d/conf.cap"
@@ -3407,7 +3410,7 @@ t_batching() {
   else t_bad "batching: cap 0 means one call for everything" "saw $_a arg(s)"; fi
 }
 
-t_picture_input() {
+rt_picture_input() {
   _d="$T_TMP/pics"; t_world "$_d"
   # a real PNG, so 'file' reports PNG and settle can parse it
   /usr/bin/python3 - "$_d/drop/shot.png" <<'_EOPNG_'
@@ -3441,7 +3444,7 @@ _EOPNG_
 }
 
 # ---- my-scan and my-ocr must accept the SAME input types ------------------
-t_types_agree() {
+rt_types_agree() {
   _mo="$(sed -n 's/^MY_OCR="\(.*\)"/\1/p' <"$T_CONF" 2>/dev/null)"
   _real="$("$0" --create-config 2>/dev/null | sed -n 's/^MY_OCR="\(.*\)"/\1/p')"
   [ -x "$_real" ] || { t_ok "type agreement: my-ocr not installed here -- skipped"; return 0; }
@@ -3461,7 +3464,7 @@ t_types_agree() {
 }
 
 # ---- the one slow line comes last ----------------------------------------
-t_status_order() {
+rt_status_order() {
   _d="$T_TMP/order"; t_world "$_d"
   # a device that cannot answer: the ping then costs its full timeout
   sed -e 's|^SCAN_DEVICE=.*|SCAN_DEVICE="http://192.0.2.1/eSCL"|' "$T_CONF" >"$_d/conf.dev"
@@ -3474,7 +3477,7 @@ t_status_order() {
 }
 
 # ---- leftovers must be recoverable ---------------------------------------
-t_retry() {
+rt_retry() {
   _d="$T_TMP/retry"; t_world "$_d"
   # a file stranded in the OCR queue by a crashed run, and one my-ocr failed
   t_pdf "$_d/2ocr/2026-09-08_0101.01___stranded.pdf"
@@ -3524,7 +3527,7 @@ t_retry() {
 # This is the configuration every real machine runs (LOG is set), and it is the
 # one the suite did NOT exercise -- so a listing that answered into the logfile
 # went unnoticed until it was seen on a live host.
-t_listing_not_swallowed_by_log() {
+rt_listing_not_swallowed_by_log() {
   _d="$T_TMP/logging"; t_world "$_d"
   sed -e "s|^LOG=.*|LOG=\"$_d/my-scan.log\"|" "$T_CONF" >"$_d/conf.log"
   t_pdf "$_d/drop/pending.pdf"
@@ -3552,7 +3555,7 @@ t_listing_not_swallowed_by_log() {
 }
 
 # ---- reset must hand my-ocr's machinery back to my-ocr --------------------
-t_reset_delegates() {
+rt_reset_delegates() {
   # shellcheck disable=SC2016  # matching a literal '$MY_OCR' in the source
   if awk '/^do_reset\(\) \{/,/^\}/' "$0" | grep -q '"\$MY_OCR" reset'; then
     t_ok "reset delegates my-ocr's machinery to 'my-ocr reset'"
@@ -3563,7 +3566,7 @@ t_reset_delegates() {
 }
 
 # ---- --test-mail goes the alerts' way, and never passes with mail off ----
-t_test_mail() {
+rt_test_mail() {
   _d="$T_TMP/testmail"; t_world "$_d"
   _a="$_d/notify.args"
   { cat "$T_CONF"
@@ -3637,7 +3640,7 @@ t_test_mail() {
 }
 
 # ---- my-ocr's own suite, because the two belong together -----------------
-t_my_ocr_suite() {
+rt_my_ocr_suite() {
   # the REAL my-ocr, not the stub: read it from a default config, since
   # --run-tests deliberately loads no config of its own.
   _mo="$("$0" --create-config 2>/dev/null | sed -n 's/^MY_OCR="\(.*\)"/\1/p')"
@@ -3660,7 +3663,7 @@ t_my_ocr_suite() {
 # "change nothing", and honoured by setup/uninstall/reset/cleanup only. The
 # process path ignored it, so a "preview" moved the delivery, staged it, ran a
 # real OCR and quarantined the document.
-t_dry_run() {
+rt_dry_run() {
   _d="$T_TMP/dryrun"; t_world "$_d"
   t_pdf "$_d/drop/preview.pdf"
   _o="$("$0" --config "$T_CONF" --dry-run process --all 2>&1 </dev/null)"
@@ -3700,7 +3703,7 @@ t_dry_run() {
 # A config written before a key existed must not silently change behaviour.
 # IGNORE_FILENAME_PATTERNS unset means is_ignored_name matches nothing, and
 # every dotfile the FTP server drops counts as a document waiting to be OCRed.
-t_config_keys() {
+rt_config_keys() {
   _d="$T_TMP/cfgkeys"; t_world "$_d"
   grep -v '^IGNORE_FILENAME_PATTERNS=' "$T_CONF" >"$_d/conf.old"
   _o="$("$0" --config "$_d/conf.old" status 2>&1 </dev/null)"
@@ -3732,7 +3735,7 @@ t_config_keys() {
 
 # The gate shipped INERT on a host that had qpdf, because the config predated
 # c_qpdf and an unset path was read as "skip the check".
-t_pdfinfo_autodetect() {
+rt_pdfinfo_autodetect() {
   _d="$T_TMP/pdfinfoauto"; mkdir -p "$_d"
   t_pdf "$_d/a.pdf"; t_pdf "$_d/b.pdf"
   # count_docs_pages is what `status` prints
@@ -3756,7 +3759,7 @@ t_pdfinfo_autodetect() {
   esac
 }
 
-t_qpdf_autodetect() {
+rt_qpdf_autodetect() {
   if ! command -v qpdf >/dev/null 2>&1 && [ ! -x /usr/local/bin/qpdf ] \
      && [ ! -x /opt/homebrew/bin/qpdf ]; then
     t_ok "qpdf autodetect: skipped, no qpdf on this host"; return 0
@@ -3784,7 +3787,7 @@ startxref
 # A file nobody is writing, whose size is steady and which does not parse, is
 # damaged. Waiting the full SETTLE_TIMEOUT for it costs 10 minutes per corrupt
 # delivery -- two of them in the backlog cost 20 minutes of doing nothing.
-t_settle_giveup() {
+rt_settle_giveup() {
   if ! command -v lsof >/dev/null 2>&1 && [ ! -x /usr/sbin/lsof ]; then
     t_ok "settle give-up: skipped, no lsof (the rule needs the writer check)"; return 0
   fi
@@ -3814,7 +3817,7 @@ t_settle_giveup() {
 # Documentation is not executed, so it rots silently. my-ocr has had this
 # check for a while; my-scan did not, which is how a --dry-run documented as
 # "change nothing" could go on staging, moving and OCRing for as long as it did.
-t_help_claims() {
+rt_help_claims() {
   _h="$("$0" --help 2>&1)"
   for _o in -h --help -Q --quiet -V --verbose -D --debug -DD --deepdebug \
             -L --no-log --watch --config --create-config --dry-run --version \
@@ -3843,7 +3846,7 @@ t_help_claims() {
 
 # "my-scan -DD process" must run PROCESS, not swallow it as a debug log path.
 # It did, and the run reported success while doing nothing whatsoever.
-t_opt_arg_not_subcommand() {
+rt_opt_arg_not_subcommand() {
   _d="$T_TMP/optarg"; t_world "$_d"
   t_pdf "$_d/drop/opt.pdf"
   # the flag FIRST, with the subcommand after it -- the form that broke
@@ -3866,7 +3869,7 @@ t_opt_arg_not_subcommand() {
 # -Q is about the TERMINAL, not the record. It silenced nothing at all until
 # 2026-09-18: the process path printed through pe(), which had no QUIET check,
 # and it LOOKED right only because output was redirected into the logfile.
-t_quiet() {
+rt_quiet() {
   _d="$T_TMP/quiet"; t_world "$_d"
   t_pdf "$_d/drop/q1.pdf"
 
@@ -3917,7 +3920,7 @@ t_quiet() {
 
 # "5 document(s) / 14 page(s), 6 BROKEN, 1 EMPTY" -- twelve files described as
 # five, because the lead count named one class and the others sat beside it.
-t_counts_add_up() {
+rt_counts_add_up() {
   _d="$T_TMP/counts"; t_world "$_d"
   _q="$_d/failed"; mkdir -p "$_q"
   t_pdf "$_q/good.pdf"                      # ok
@@ -3939,7 +3942,7 @@ t_counts_add_up() {
   esac
 }
 
-t_failed_are_counted() {
+rt_failed_are_counted() {
   # A document my-ocr could not OCR is MOVED out of the queue, so the filing
   # loop no longer finds it. That is how a run where all ten documents failed
   # still printed "0 failed": nothing was there to count. The partition must
@@ -3991,7 +3994,7 @@ t_failed_are_counted() {
 # (the scan host's, pulled from GitHub) was taken for a foreign repo and fell
 # back to the stamp. The proof is the stamped PARENT now. And the case the proof
 # exists for must still hold: a copy inside a foreign repo reports NOT its tags.
-t_version_clone() {
+rt_version_clone() {
   _vc="$T_TMP/vclone"; rm -rf "$_vc"; mkdir -p "$_vc/src" "$_vc/foreign"
   cp "$0" "$_vc/src/$US"
   (
@@ -4024,7 +4027,7 @@ t_version_clone() {
 
 # A name handed over directly is ignored by the same patterns as a folder walk.
 t_set_ignore() { IGNORE_FILENAME_PATTERNS="$1"; } # INSIDE a subshell only
-t_ignored_inputs() {
+rt_ignored_inputs() {
   _ii_o="$( t_set_ignore '.* *.part'
             printf '%s\n' "/x/.pureftpd-upload.6ab677d0.52da" "/x/scan20260925_143200.pdf" "/x/b.part" | collect_inputs )"
   if [ "$_ii_o" = "/x/scan20260925_143200.pdf" ]; then
@@ -4034,44 +4037,50 @@ t_ignored_inputs() {
   fi
 }
 
-do_run_tests() {
-  _p "$US --run-tests   ($(head -1 "$0"))"
+# A test left out of the run list never runs, silently -- so the list is checked.
+rt_run_list_complete() {
+  _rt_def="$(grep -c '^rt_[a-z_]*() {$' "$0")"
+  # shellcheck disable=SC2086  # deliberate: the list is words, one per test
+  _rt_len="$(printf '%s\n' $_rt_all | grep -c .)"
+  if [ "$_rt_def" = "$_rt_len" ]; then
+    t_ok "every test function is in the run list ($_rt_def defined, $_rt_len listed)"
+  else
+    t_bad "every test function is in the run list" "$_rt_def defined, $_rt_len listed"
+  fi
+}
+
+# The tests, in order: one function per area, rt_<name>; FILTER picks the tests
+# whose name contains it. TAP-style: "1..N" first, then "ok K - name" /
+# "not ok K - name" as each test ends.
+_rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
+  concurrent_process workflow partial_delivery deep_check cleanup batching
+  picture_input types_agree status_order retry listing_not_swallowed_by_log
+  reset_delegates test_mail help_claims opt_arg_not_subcommand quiet
+  counts_add_up failed_are_counted dry_run config_keys qpdf_autodetect
+  pdfinfo_autodetect settle_giveup version_clone ignored_inputs my_ocr_suite
+  run_list_complete"
+
+do_run_tests() { # $1 = optional FILTER
+  _rt_filter="$1"
+  _rt_n=0
+  for _rt_t in $_rt_all; do
+    case "$_rt_t" in *"$_rt_filter"*) _rt_n=$(( _rt_n + 1 )) ;; esac
+  done
+  echo "1..$_rt_n"
+  _p "$US --run-tests${_rt_filter:+ $_rt_filter}   ($(head -1 "$0"))"
   T_TMP="$(mktemp -d /tmp/my-scan.tests.XXXXXX)" || { _p "mktemp failed"; return 1; }
-  t_stage_inputs
-  t_stage_settle
-  t_stage_staging
-  t_stage_batch
-  t_stage_failure
-  t_concurrent_process
-  t_workflow
-  t_partial_delivery
-  t_deep_check
-  t_cleanup
-  t_batching
-  t_picture_input
-  t_types_agree
-  t_status_order
-  t_retry
-  t_listing_not_swallowed_by_log
-  t_reset_delegates
-  t_test_mail
-  t_help_claims
-  t_opt_arg_not_subcommand
-  t_quiet
-  t_counts_add_up
-  t_failed_are_counted
-  t_dry_run
-  t_config_keys
-  t_qpdf_autodetect
-  t_pdfinfo_autodetect
-  t_settle_giveup
-  t_version_clone
-  t_ignored_inputs
-  t_my_ocr_suite
+  _rt_k=0
+  for _rt_t in $_rt_all; do
+    case "$_rt_t" in *"$_rt_filter"*) ;; *) continue ;; esac
+    _rt_k=$(( _rt_k + 1 )); _rt_bad=$T_FAIL
+    "rt_$_rt_t"
+    if [ "$T_FAIL" = "$_rt_bad" ]; then echo "ok $_rt_k - $_rt_t"; else echo "not ok $_rt_k - $_rt_t"; fi
+  done
   rm -rf "$T_TMP"
   _p "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
   [ "$T_FAIL" -eq 0 ]
+}
 }
 
 ##############################################################################
@@ -4149,9 +4158,11 @@ OPTIONS:
   --create-config [<FILE>]  Print the default config, or write it to FILE
   --dry-run                 Show what would change; change nothing
   --version                 Print version, commit and build id
-  --run-tests               Run the regression suite -- every stage of my-scan
+  --run-tests [<FILTER>]    Run the regression suite -- every stage of my-scan
                             against temp dirs and a stub my-ocr, then my-ocr's
-                            own suite. Starts no scan and no OCR.
+                            own suite. Starts no scan and no OCR. FILTER runs
+                            only the tests whose name contains it. Prints
+                            "1..N" first, then "ok K - name" per test.
   --test-mail               Send ONE test mail the way the alerts go (NOTIFY_VIA,
                             NOTIFY_MAIL_TO/_FROM, my_notify) and exit. Fails when
                             mail is off in the config or my-notify fails.
@@ -4232,7 +4243,7 @@ while [ $# -gt 0 ]; do
     -D|--debug)          DBG=1; opt_arg "$1" && { DBG_LOGFILE="$1"; shift; } ;;
     -DD|--deepdebug)     DEEPDBG=1; opt_arg "$1" && { DBG_LOGFILE="$1"; shift; } ;;
     -L|--no-log)         NO_LOG=1 ;;
-    --run-tests)         RUN_TESTS=1 ;;
+    --run-tests)         RUN_TESTS=1; case "$1" in ""|-*) ;; *) RUN_TESTS_FILTER="$1"; shift ;; esac ;;
     --test-mail)         TEST_MAIL=1 ;;
     --watch)             WATCH=1; opt_arg "$1" && { WATCH_INTERVAL_OVERRIDE="$1"; shift; } ;;
     --watch=*)           WATCH=1; WATCH_INTERVAL_OVERRIDE="${_a#--watch=}" ;;
@@ -4274,7 +4285,7 @@ done
 # stamp-version edits this file and needs no config either
 [ "$WHAT" = "stamp-version" ] && { do_stamp_version; exit 0; }
 # --run-tests builds its own worlds and configs, so it needs no config of its own
-[ -n "$RUN_TESTS" ] && { do_run_tests; exit $?; }
+[ -n "$RUN_TESTS" ] && { do_run_tests "$RUN_TESTS_FILTER"; exit $?; }
 
 load_config
 
