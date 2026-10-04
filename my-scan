@@ -11,15 +11,15 @@
 # 092 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="39630d3"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="66a915d"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.1-5-g39630d3"
+SCRIPT_RELEASE="v1.1-6-g66a915d"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="ccfc448"
+SCRIPT_PARENT="e2cc2d4"
 
 US="${0##*/}"
 
@@ -2459,13 +2459,15 @@ _EOWC_
   return 0
 }
 
-# Is WORKFLOW_NAME attached, and enabled, on folder $1? Read from the Folder
+# Is a workflow attached, and enabled, on folder $1? Read from the Folder
 # Actions dispatcher's preferences, as 'status' does -- never from System
 # Events, which can wait for ever on a consent dialog nobody sees (ssh). The
 # bindings are an NSKeyedArchiver blob; each folder action holds a bookmark
 # whose sandbox entry ends in the folder's RESOLVED path, lower-cased. Prints
 # what is missing; returns 0 attached, 1 not, 2 when it cannot tell.
-fa_bound() { # $1 = folder, $2 = preferences file (default: exported now)
+# Self-contained (with fa_prefs_export and canon_dir), so another tool that
+# wires a Folder Action can copy it as it is.
+fa_bound() { # $1 = folder, $2 = preferences file ("" = exported now), $3 = workflow (default: WORKFLOW_NAME)
   _fab_tmp=""
   _fab_prefs="$2"
   if [ -z "$_fab_prefs" ]; then
@@ -2475,7 +2477,7 @@ fa_bound() { # $1 = folder, $2 = preferences file (default: exported now)
       rm -f "$_fab_tmp"; _p "no folder-action preferences -- nothing is attached anywhere"; return 1
     fi
   fi
-  MY_SCAN_FA_DIR="$(canon_dir "$1")" MY_SCAN_FA_WF="$WORKFLOW_NAME" \
+  MY_SCAN_FA_DIR="$(canon_dir "$1")" MY_SCAN_FA_WF="${3:-$WORKFLOW_NAME}" \
   /usr/bin/python3 -B - "$_fab_prefs" <<'_EOFA_'
 import os, plistlib, re, sys
 d, wf = os.environ["MY_SCAN_FA_DIR"], os.environ["MY_SCAN_FA_WF"]
@@ -3359,8 +3361,9 @@ rt_workflow() {
   # A second run right after the first must not rewrite the workflow: no backup
   # appears, and the dry run calls it OK. (Only the workflow: System Events
   # attaches a script by NAME from the standard Folder Actions folder, so the
-  # test's temporary WORKFLOW_DIR is never really attached -- the binding check
-  # is rt_fa_bound's, against preferences of the real shape.)
+  # test's temporary WORKFLOW_DIR is never really attached -- the binding is
+  # rt_fa_bound's, against preferences of the real shape, and the real attach
+  # is rt_fa_live's.)
   "$0" --config "$T_CONF" setup go >/dev/null 2>&1 </dev/null
   _bk="$(find "$T_WFDIR" -maxdepth 1 -name 'my-scan.workflow.bak-*' 2>/dev/null | wc -l | tr -d ' ')"
   _o="$("$0" --config "$T_CONF" setup 2>&1 </dev/null)"
@@ -4232,6 +4235,56 @@ _EOFX_
   _fb_case /nosuch/fa/scans  "$T_TMP/no-such.plist" 2 "cannot read"  "unreadable preferences: cannot tell, never 'attached'"
 }
 
+# ---- the REAL attach, end to end -----------------------------------------
+# REUSABLE: any tool whose 'setup go' attaches a Folder Action workflow and
+# whose 'uninstall go' takes it out again (my-scan and my-ocr share the shape)
+# can copy this with fa_bound, fa_prefs_export, canon_dir and osa_can_prompt.
+# The caller writes the config; this only drives the tool's own verbs.
+#
+# System Events attaches a script by NAME from the standard Folder Actions
+# folder only, so the workflow must really live there -- under a name of its
+# own, so it never touches the live one. Leaves nothing attached; the workflow
+# goes to the Trash through the tool's own 'uninstall go'.
+t_fa_live_attach() { # $1 config, $2 folder, $3 workflow name, $4 workflow dir, $5 label
+  if ! osa_can_prompt; then
+    t_ok "$5: skipped, no GUI session here (ssh, or not the console user) -- System Events cannot be asked"
+    return 0
+  fi
+  _fl_log="$T_TMP/fa-live.$$.log"
+  "$0" --config "$1" setup go >"$_fl_log" 2>&1 </dev/null
+  _fl_o="$(fa_bound "$2" "" "$3")"; _fl_r=$?
+  if [ "$_fl_r" -eq 0 ]; then
+    t_ok "$5: 'setup go' really attaches '$3' to the folder [0]"
+    _fl_o="$("$0" --config "$1" setup 2>&1 </dev/null)"
+    case "$_fl_o" in
+      *"everything is in place -- nothing to change [0 changes]"*)
+        t_ok "$5: a setup right after it finds everything in place [0 changes]";;
+      *) t_bad "$5: a setup right after it finds everything in place" \
+               "$(printf '%s\n' "$_fl_o" | grep -E 'WOULD|differs|not attached|change' | head -n 2 | tr '\n' ' ')";;
+    esac
+  else
+    t_bad "$5: 'setup go' really attaches '$3' to the folder" \
+          "[$_fl_r] $_fl_o -- setup said: $(grep -E 'COULD NOT|TIMED OUT|attached' "$_fl_log" | head -n 1)"
+  fi
+  # always undone, whatever failed above
+  "$0" --config "$1" uninstall go >>"$_fl_log" 2>&1 </dev/null
+  _fl_o="$(fa_bound "$2" "" "$3")"; _fl_r=$?
+  if [ "$_fl_r" -eq 1 ] && [ ! -e "$4/$3" ]; then
+    t_ok "$5: 'uninstall go' detaches it and removes the workflow [1]"
+  else
+    t_bad "$5: 'uninstall go' detaches it and removes the workflow" \
+          "[$_fl_r] $_fl_o; left: $( [ -e "$4/$3" ] && echo "'$4/$3' (remove it by hand)" || echo "no workflow" )"
+  fi
+}
+
+rt_fa_live() {
+  _d="$T_TMP/falive"; t_world "$_d"
+  _fl_dir="$HOME/Library/Workflows/Applications/Folder Actions"
+  _fl_name="my-scan-test-$$.workflow"
+  printf 'WORKFLOW_DIR="%s"\nWORKFLOW_NAME="%s"\n' "$_fl_dir" "$_fl_name" >>"$T_CONF"
+  t_fa_live_attach "$T_CONF" "$_d/drop" "$_fl_name" "$_fl_dir" "live attach"
+}
+
 # An error code exists to find its ONE source line: unique, five digits,
 # numbered from 1 in file order with no gap. A copied line keeps its code and
 # silently points two failures at one place -- so the numbering is checked.
@@ -4263,7 +4316,7 @@ rt_run_list_complete() {
 # whose name contains it. TAP-style: "1..N" first, then "ok K - name" /
 # "not ok K - name" as each test ends.
 _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
-  concurrent_process workflow fa_bound partial_delivery deep_check cleanup batching
+  concurrent_process workflow fa_bound fa_live partial_delivery deep_check cleanup batching
   picture_input types_agree status_order retry listing_not_swallowed_by_log
   reset_delegates test_mail help_claims opt_arg_not_subcommand quiet
   counts_add_up failed_are_counted dry_run config_keys qpdf_autodetect
