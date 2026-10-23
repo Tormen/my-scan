@@ -1486,6 +1486,20 @@ do_cleanup_unrecoverable() {
 # back in FAILED, so a retry can be repeated without making a mess.
 do_retry_batch() {
   _rb_n="$(printf '%s\n' "$INP_FILES" | awk 'NF{n++} END{print n+0}')"
+  # The one place a retry moves anything, so guarding it here makes --dry-run
+  # true for every --retry path, as stage_file does for the drop folder.
+  if [ -n "$DRY_RUN" ]; then
+    printf '%s\n' "$INP_FILES" | while IFS= read -r _rf; do
+      case "$_rf" in
+        "")                 ;;
+        "$T_PATH_FAILED"/*) pe "  >  WOULD requeue '${_rf##*/}' and hand it to my-ocr" ;;
+        *)                  pe "  >  WOULD hand '${_rf##*/}' to my-ocr" ;;
+      esac
+    done
+    pe " >>> RETRY: WOULD hand $_rb_n file(s) back to $MY_OCR"
+    pe "     Nothing was moved or OCRed -- this was a --dry-run."
+    return 0
+  fi
   pe " >>> RETRY: handing $_rb_n file(s) back to my-ocr"
   mkdir -p "$OCR_QUEUE_PATH" 2>/dev/null
   # move FAILED ones back into the queue first: that is where my-ocr's caller
@@ -1715,8 +1729,17 @@ _EOPI_
   # a summary IS the noise a crontab mails every night -- gated like the rest,
   # and still written in full whenever the destination is the logfile
   if ! quiet_out; then
-  printf "%sGot %4d file(s):\n"                 "$_pfx" "$INP_FILES_CNT"
-  printf "%s  > %4d OCRed and filed.\n"         "$_pfx" "$FILES_OCRED_CNT"
+  # A dry run hands nothing to my-ocr, so what it WOULD hand is the OCR line's
+  # count -- counting the real (zero) result there is what claimed a lost document.
+  if [ -n "$DRY_RUN" ]; then
+    _ocred="$(printf '%s\n' "$_staged" | awk 'NF{n++} END{print n+0}')"
+    printf "%sGot %4d file(s) -- --dry-run, what WOULD happen:\n" "$_pfx" "$INP_FILES_CNT"
+    printf "%s  > %4d to be OCRed and filed.\n" "$_pfx" "$_ocred"
+  else
+    _ocred="$FILES_OCRED_CNT"
+    printf "%sGot %4d file(s):\n"               "$_pfx" "$INP_FILES_CNT"
+    printf "%s  > %4d OCRed and filed.\n"       "$_pfx" "$_ocred"
+  fi
   printf "%s  > %4d filed without OCR.\n"       "$_pfx" "$IGNORED_CNT"
   printf "%s  > %4d failed (of which %d wrong file type).\n" \
                                                 "$_pfx" "$FAILED_CNT" "$WRONG_FILETYPE_CNT"
@@ -1724,7 +1747,7 @@ _EOPI_
   # documents went somewhere nobody accounted for, and a summary that hides
   # that is worse than no summary -- so say it rather than print a total that
   # quietly contradicts its own parts.
-  _sum=$(( FILES_OCRED_CNT + IGNORED_CNT + FAILED_CNT ))
+  _sum=$(( _ocred + IGNORED_CNT + FAILED_CNT ))
   [ "$_sum" -ne "$INP_FILES_CNT" ] && \
     printf "%s  !!! these do not add up: %d accounted for, %d received -- %d document(s) unaccounted\n" \
            "$_pfx" "$_sum" "$INP_FILES_CNT" "$(( INP_FILES_CNT - _sum ))"
@@ -3851,6 +3874,59 @@ rt_dry_run() {
   fi
 }
 
+# The retry path had no guard: '--dry-run process --retry failed --all' moved
+# the FAILED files back, ran a real OCR and filed two documents.
+rt_dry_run_retry() {
+  _d="$T_TMP/dryretry"; t_world "$_d"
+  t_pdf "$_d/2ocr/2026-09-08_0101.01___stranded.pdf"
+  t_pdf "$_d/failed/2026-09-08_0102.02___didnotwork.pdf"
+  _o="$("$0" --config "$T_CONF" --dry-run process --retry all --all 2>&1 </dev/null)"
+  if [ -f "$_d/2ocr/2026-09-08_0101.01___stranded.pdf" ] \
+     && [ -f "$_d/failed/2026-09-08_0102.02___didnotwork.pdf" ] \
+     && [ -z "$(find "$_d/done" -type f 2>/dev/null)" ]; then
+    t_ok "--dry-run --retry: nothing is requeued or filed"
+  else
+    t_bad "--dry-run --retry: nothing is requeued or filed" \
+          "$(find "$_d/2ocr" "$_d/done" "$_d/failed" -type f 2>/dev/null | tr '\n' ' ')"
+  fi
+  if [ -f "$_d/ocr.called" ]; then
+    t_bad "--dry-run --retry: my-ocr is never called" "a real OCR ran during a dry run"
+  else
+    t_ok "--dry-run --retry: my-ocr is never called"
+  fi
+  case "$_o" in
+    *"WOULD requeue"*didnotwork*"WOULD hand 2 file(s)"*) t_ok "--dry-run --retry: it says what it WOULD do";;
+    *) t_bad "--dry-run --retry: it says what it WOULD do" "$(printf '%s' "$_o" | tail -n 3)";;
+  esac
+  # not vacuous: the same run without it does requeue and OCR
+  "$0" --config "$T_CONF" process --retry all --all >/dev/null 2>&1 </dev/null
+  if [ -f "$_d/ocr.called" ] && [ ! -f "$_d/failed/2026-09-08_0102.02___didnotwork.pdf" ]; then
+    t_ok "--dry-run --retry: the same run WITHOUT it does requeue and OCR (so the test is not vacuous)"
+  else
+    t_bad "--dry-run --retry: the same run WITHOUT it does requeue and OCR (so the test is not vacuous)" \
+          "a real run did nothing either"
+  fi
+}
+
+# The dry-run summary counted the OCR it did not run (0) against the files it
+# received, and reported "1 document(s) unaccounted" for a file it only WOULD stage.
+rt_dry_run_summary() {
+  _d="$T_TMP/drysum"; t_world "$_d"
+  t_pdf "$_d/drop/preview.pdf"
+  _o="$("$0" --config "$T_CONF" --dry-run process --all 2>&1 </dev/null)"
+  case "$_o" in
+    *unaccounted*|*"do not add up"*)
+      t_bad "--dry-run summary: no lost document is claimed" \
+            "$(printf '%s\n' "$_o" | grep -e 'do not add up' | head -n 1)";;
+    *) t_ok "--dry-run summary: no lost document is claimed";;
+  esac
+  case "$_o" in
+    *"WOULD happen"*"   1 to be OCRed and filed."*) t_ok "--dry-run summary: it counts the file it WOULD hand to my-ocr";;
+    *) t_bad "--dry-run summary: it counts the file it WOULD hand to my-ocr" \
+             "$(printf '%s\n' "$_o" | grep -e '>RESULT<' | tr '\n' ' ')";;
+  esac
+}
+
 # A config written before a key existed must not silently change behaviour.
 # IGNORE_FILENAME_PATTERNS unset means is_ignored_name matches nothing, and
 # every dotfile the FTP server drops counts as a document waiting to be OCRed.
@@ -4319,7 +4395,7 @@ _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
   concurrent_process workflow fa_bound fa_live partial_delivery deep_check cleanup batching
   picture_input types_agree status_order retry listing_not_swallowed_by_log
   reset_delegates test_mail help_claims opt_arg_not_subcommand quiet
-  counts_add_up failed_are_counted dry_run config_keys qpdf_autodetect
+  counts_add_up failed_are_counted dry_run dry_run_retry dry_run_summary config_keys qpdf_autodetect
   pdfinfo_autodetect settle_giveup version_clone ignored_inputs my_ocr_suite
   err_codes run_list_complete"
 
