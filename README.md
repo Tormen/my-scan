@@ -4,11 +4,10 @@ Receives what the scanner pushes, waits until the delivery is actually
 complete, hands the OCR to `my-ocr`, and files the result. It can also
 pull-scan a device directly.
 
-**Especially useful together with [my-ocr](../my-ocr/) and ABBYY FineReader Pro
-for Mac 12.1.14** (`/Applications/FineReader.app`, bundle
-`com.abbyy.FineReaderPro`): that FineReader has no command line, my-ocr gives it
-one and serialises it, and my-scan puts a scanner in front of it. The three
-together are an unattended scan-to-searchable-PDF pipeline.
+**Especially useful together with [my-ocr](../../py/my-ocr/)**, which owns the
+OCR engine and serialises it; my-scan puts a scanner in front of it. Together
+they are an unattended scan-to-searchable-PDF pipeline. my-scan never names the
+engine itself: `status` and `setup` show my-ocr's own `ENGINE` line.
 
 ```
 usage: my-scan [OPTIONAL] <MANDATORY> parameters.
@@ -46,15 +45,14 @@ and run one Automator step:
 
 | | my-scan | my-ocr |
 |---|---|---|
-| owns | receiving a scan: settle, name, file | OCR: FineReader, its Automator wiring, the mutex |
-| Folder Action | the scanner's drop folder | `~/Public/,ocr.in` |
+| owns | receiving a scan: settle, name, file | OCR: the engine, the mutex |
+| Folder Action | the scanner's drop folder | none -- my-scan calls it |
 | config | `/LINKS/default/my-scan` | its own |
 
-They meet at one point: my-scan runs `my-ocr <files>`. **my-scan never touches
-`,ocr.in`**, and my-ocr knows nothing about scanners.
+They meet at one point: my-scan runs `my-ocr <files>`, and my-ocr knows
+nothing about scanners.
 
-Exactly one FineReader run can exist at a time — one GUI application, one
-Automator wiring — and my-ocr is what guarantees it. So my-scan keeps no lock
+Exactly one OCR run can exist at a time, and my-ocr is what guarantees it. So my-scan keeps no lock
 and no queue: a second `my-scan process` simply blocks inside `my-ocr` until
 its turn.
 
@@ -92,15 +90,17 @@ SCANNER   CHANGEME (http://…/eSCL)  not answering (normally off) [2]
 DROP      ftp  .../ftp/in/scans      3 waiting
 QUEUE     2ocr .../01_scans_2ocr     2 files
 QUEUE     fail .../02_FAILED_OCR     0 files
-FOLDERACT enabled=true workflows=my-scan.workflow
+FOLDERACTION ftp  my-scan.workflow attached [0]
 MY-OCR    idle
-OCRAPP    FineReader not running (/Applications/FineReader.app)
+ENGINE    DEVONthink installed, not running   [/Applications/DEVONthink.app]
+SETTINGS  languages ..., deskew on, page orientation on, ...
 RUNNING   <none>
 ```
 
 Every conclusion carries the value it came from, so a wrong one is visible
 without debugging. `MY-OCR` is one line from `my-ocr --status` — is the OCR
-busy, the fact you ran `status` for. `-V` adds my-ocr's full detail, the
+busy, the fact you ran `status` for — and `ENGINE` / `SETTINGS` are its lines,
+verbatim. `FOLDERACTION` is my-scan's own workflow, one line per drop folder. `-V` adds my-ocr's full detail, the
 per-file settle report, the plist keys and the workflow path.
 
 `SCAN_DEVICE_USUALLY_OFF=1` makes a powered-down scanner report *not answering
@@ -163,7 +163,7 @@ stranded in the queue.
 
 The lock covers **staging only**. Once a file has been moved out of the drop
 folder it is uniquely claimed, so OCR and filing run unlocked — my-ocr's own
-mutex is what serialises FineReader. A dead owner's lock is broken
+mutex is what serialises the OCR. A dead owner's lock is broken
 automatically and never silently; a live one is waited for
 (`STAGE_LOCK_TIMEOUT`).
 
@@ -375,7 +375,6 @@ my-scan --create-config | diff - /LINKS/default/my-scan
 | `T_PATH_DONE` / `T_PATH_FAILED` | filed, and failed out |
 | `MY_OCR` | the OCR tool. my-scan does the scanning; my-ocr does the OCR |
 | `SETTLE_*` | timeout, poll, stability count, writer list, `lsof` search |
-| `OCRAPP_*` | which OCR application, for `status` and `setup` |
 | `WORKFLOW_*` | what `setup` writes, and the path the workflow calls |
 | `SCAN_*` | device, mode, resolution, output folder, viewer |
 | `NO_OCR_PATTERNS` | filenames filed without OCR (default `no-ocr-scan*`) |
@@ -447,7 +446,3 @@ The workflow also records the folder it serves (`folderActionFolderPath`);
 without it Automator shows "Folder Action receives files and folders added to:
 Choose folder" and nothing arrives. Both halves matter: the folder inside the
 workflow, and the binding of that workflow to the same folder.
-
-Chained Folder Actions do **not** deadlock: my-scan's action calls my-ocr,
-which drives its own action on `,ocr.in`, and the round trip completes in
-about half a minute. `FolderActionsDispatcher` does not serialise globally.
