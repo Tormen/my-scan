@@ -189,16 +189,12 @@ the default view reports documents only and `-V` counts the pages.
 
 ### Input types
 
-PDF, PNG, JPEG and TIFF. Pictures are fine — the OCR application turns them into a
-searchable PDF, and one picture is one page. my-scan's `ACCEPT_FILE_TYPE_REGEX`
-and my-ocr's `S_EXPECTED_FILE_TYPE___REGEX` must list the same set: a type only
-one of them accepts is a document that settles, stages and then fails. The test
-suite compares the two and fails if they drift.
-
-Every type on that list was tried against the real OCR application rather than
-assumed -- TIFF was added only after FineReader was shown to take one and
-return a searchable PDF. WebP is deliberately absent: macOS `sips` cannot even
-write it on these machines, and this FineReader predates WebP by years.
+Whatever my-ocr takes -- today PDF, JPEG, PNG and TIFF; one picture is one
+page. my-scan keeps no list of its own: each `process` run reads my-ocr's
+`TYPES` line from `my-ocr --status` once, before it takes anything, and files a
+delivery of any other type (by the first word of `file --brief`) under FAILED.
+When my-ocr names no types, the run takes nothing, leaves the deliveries in the
+drop folders and fails with an ERROR that says so.
 
 ## Checking the document, at both ends
 

@@ -351,17 +351,6 @@ T_PATH_FAILED="/CHANGEME/scans/02_FAILED_OCR"
 # a delivery is read from DROP_PATHS, waits here, and is filed in T_PATH_DONE.
 OCR_QUEUE_PATH="/CHANGEME/scans/01_scans_2ocr"
 
-# Accepted input, as the BEGINNING of `file --brief` output. A light check
-# only: my-ocr does the deep validation and knows more about it than my-scan
-# should.
-# What 'process' will hand to my-ocr. Pictures are fine: the OCR application
-# turns them into a searchable PDF, and my-ocr accepts the same set. Keep this
-# in step with my-ocr's S_EXPECTED_FILE_TYPE___REGEX -- a type accepted here
-# and refused there is a document that settles, stages, and then fails. Each of
-# these was tried against the real OCR application, not assumed: TIFF was added
-# only after the OCR application was shown to accept one and return a searchable PDF.
-ACCEPT_FILE_TYPE_REGEX="JPEG \|PDF \|PNG \|TIFF "
-
 # Filenames matching these shell patterns skip OCR and go straight to DONE:
 NO_OCR_PATTERNS="no-ocr-scan*"
 
@@ -406,7 +395,7 @@ OCR_BATCH_MAX_PAGES=10
 # What a document that went through the OCR says in its PDF 'Producer'. It is
 # the only proof my-scan accepts before filing a document as done; one without
 # it stays in the queue for the next run. Must match my-ocr's own
-# OCRAPP_PRODUCER_TAG -- that is how my-ocr recognises its output, too.
+# PRODUCER_TAG -- that is how my-ocr recognises its output, too.
 OCR_PRODUCER_TAG="FineReader"
 
 # Counting pages costs a pdfinfo per document (~25ms). Worth it for a queue,
@@ -1518,6 +1507,18 @@ do_retry_batch() {
   return 0
 }
 
+# The file types my-ocr takes, space-separated, as the first word of
+# `file --brief` names them. They are my-ocr's to say -- its status line
+# 'TYPES     PDF, JPEG, PNG, TIFF' -- so an engine change never needs my-scan
+# to follow. Fails when my-ocr names none.
+ocr_types() {
+  _ot="$("$MY_OCR" --status 2>/dev/null | sed -n 's/^TYPES  *//p' | head -n 1)"
+  _ot="${_ot%%   \[*}"                      # a raw value in [...] is no type
+  _ot="$(printf '%s' "$_ot" | tr -s ', ' '  ')"
+  [ -n "${_ot# }" ] || return 1
+  printf '%s\n' "$_ot"
+}
+
 do_process() {
   [ -x "$c_trash" ]   || err 00037 "NOT FOUND: '$c_trash' (brew install trash)"
   find_pdfinfo       || err 00038 "NOT FOUND: pdfinfo (brew install poppler) -- every gate reads its page count."
@@ -1588,6 +1589,10 @@ do_process() {
 
   if [ -n "$INP_FILES" ]; then
     process_start_log
+    # asked once per run, BEFORE anything is claimed: a type my-ocr does not
+    # take is filed under FAILED here, rather than staged to fail there
+    OCR_TYPES="$(ocr_types)" || { stage_lock_release
+      err 00040 "'$MY_OCR --status' names no TYPES, so my-scan cannot tell which files my-ocr takes -- nothing was taken; update my-ocr, then '$US process --all'."; }
   fi
 
   if [ -n "$PROCESS_ALL" ]; then
@@ -1626,7 +1631,7 @@ do_process() {
     [ -z "$S_INP" ] && continue
     pe ""
     pe " >>> '$S_INP'"
-    [ -e "$S_INP" ] || { err 00040 "File '$S_INP' not found." "-"; continue; }
+    [ -e "$S_INP" ] || { err 00041 "File '$S_INP' not found." "-"; continue; }
 
     INP="${S_INP##*/}"
 
@@ -1636,7 +1641,7 @@ do_process() {
       T_PATH="$T_PATH_FAILED"; stage_file
       T_PATH="$OCR_QUEUE_PATH"
       notify_bad_delivery "$S_INP" "incomplete -- it never settled within ${SETTLE_TIMEOUT}s (${SETTLE_REASON:-unknown})"
-      err 00041 "'$S_INP' never settled within ${SETTLE_TIMEOUT}s -- filed under FAILED." "-"
+      err 00042 "'$S_INP' never settled within ${SETTLE_TIMEOUT}s -- filed under FAILED." "-"
       continue
     fi
     pe "  >  settled ($(file_size "$S_INP") bytes) [0]"
@@ -1650,7 +1655,7 @@ do_process() {
       T_PATH="$T_PATH_FAILED"; stage_file
       T_PATH="$OCR_QUEUE_PATH"
       notify_bad_delivery "$S_INP" "structurally damaged -- $DEEP_CHECK_WHY"
-      err 00042 "'$S_INP' is structurally damaged ($DEEP_CHECK_WHY) -- filed under FAILED." "-"
+      err 00043 "'$S_INP' is structurally damaged ($DEEP_CHECK_WHY) -- filed under FAILED." "-"
       continue
     fi
     settle_backup "$S_INP"
@@ -1659,7 +1664,11 @@ do_process() {
     #    already-OCRed and encrypted files itself, and knows more about them
     #    than my-scan should.
     INP_FILE_TYPE="$(file --brief "$S_INP")"
-    if printf '%s\n' "$INP_FILE_TYPE" | grep -qv "^$ACCEPT_FILE_TYPE_REGEX"; then
+    case " $OCR_TYPES " in
+      *" ${INP_FILE_TYPE%% *} "*) _type_ok=1 ;;
+      *)                          _type_ok="" ;;
+    esac
+    if [ -z "$_type_ok" ]; then
       WRONG_FILETYPE_CNT=$(( WRONG_FILETYPE_CNT + 1 ))
       FAILED_CNT=$(( FAILED_CNT + 1 ))
       T_PATH="$T_PATH_FAILED"; stage_file
@@ -1668,7 +1677,7 @@ do_process() {
         empty*) notify_bad_delivery "$S_INP" "EMPTY (0 bytes)" ;;
         *)      notify_bad_delivery "$S_INP" "unreadable -- '$INP_FILE_TYPE', not a document my-ocr can OCR" ;;
       esac
-      err 00043 "Unexpected file type '$INP_FILE_TYPE' -- filed under FAILED." "-"
+      err 00044 "Unexpected file type '$INP_FILE_TYPE' -- filed under FAILED." "-"
       continue
     fi
     pe "  >  type '$INP_FILE_TYPE' PASSED"
@@ -1865,8 +1874,8 @@ do_scan() {
   _be="$(scan_backend)"
   case "$_be" in
     scanimage) : ;;
-    "")        err 00044 "No scan backend at all: 'scanimage' is not installed and SCAN_DEVICE '$SCAN_DEVICE' names no recognised backend. Install one with 'brew install sane-backends', then '$US devices'." ;;
-    *)         err 00045 "SCAN_DEVICE '$SCAN_DEVICE' selects the '$_be' backend, which is not implemented yet -- only 'scanimage' is. Install it with 'brew install sane-backends'." ;;
+    "")        err 00045 "No scan backend at all: 'scanimage' is not installed and SCAN_DEVICE '$SCAN_DEVICE' names no recognised backend. Install one with 'brew install sane-backends', then '$US devices'." ;;
+    *)         err 00046 "SCAN_DEVICE '$SCAN_DEVICE' selects the '$_be' backend, which is not implemented yet -- only 'scanimage' is. Install it with 'brew install sane-backends'." ;;
   esac
 
   if [ -n "$1" ]; then fn="$1"; shift; else fn="$SCAN_DEFAULT_FNAME"; fi
@@ -1877,7 +1886,7 @@ do_scan() {
   SCAN_BATCH_FILENAME="${TEMPFILE_PREFIX}%d.$SCAN_FORMAT"
   SCAN_OPTS="$SCAN_DEFAULT_OPTS --mode $SCAN_MODE --resolution ${SCAN_DPI}dpi $*"
 
-  cd "$SCAN_OUT_PATH" || err 00046 "Cannot cd to SCAN_OUT_PATH '$SCAN_OUT_PATH'."
+  cd "$SCAN_OUT_PATH" || err 00047 "Cannot cd to SCAN_OUT_PATH '$SCAN_OUT_PATH'."
 
   msg "Scanning '$SCAN_DEVICE_NAME' to '$fn' in '$SCAN_OUT_PATH'"
   det "options: $SCAN_OPTS"
@@ -1907,11 +1916,11 @@ do_scan() {
   fi
 
   [ "$rc" -ne 4 ] && [ "$rc" -ne 0 ] \
-    && err 00047 "Scan failed [$rc]: $SCAN_CMDSTR  (pwd '$(pwd)')"
+    && err 00048 "Scan failed [$rc]: $SCAN_CMDSTR  (pwd '$(pwd)')"
 
   msg2 "Assembling the pages into '$fn'"
   run "$c_convert" "$SCAN_OUT_PATH/$TEMPFILE_PREFIX"* "$full_fn" \
-    || err 00048 "FAILED to assemble '$SCAN_OUT_PATH/$TEMPFILE_PREFIX'* into '$full_fn'."
+    || err 00049 "FAILED to assemble '$SCAN_OUT_PATH/$TEMPFILE_PREFIX'* into '$full_fn'."
 
   scan_cleanup
 
@@ -1919,7 +1928,7 @@ do_scan() {
     # deliberately word-split: it is a command WITH arguments ("open -a Preview")
     # shellcheck disable=SC2086
     run $SCAN_VIEWER_CMD "$full_fn" \
-      || err 00049 "FAILED [$?] to open '$full_fn' with '$SCAN_VIEWER_CMD'." "-"
+      || err 00050 "FAILED [$?] to open '$full_fn' with '$SCAN_VIEWER_CMD'." "-"
   else
     vdet "SCAN_VIEWER_CMD is empty -- not opening '$full_fn'"
   fi
@@ -2014,8 +2023,8 @@ do_watch_status() {
   # my-ocr is only consulted when the OCR queue is non-empty -- that is the
   # only time the answer can differ, and it is a process spawn per poll.
   OCR_STATE="queued for OCR"
-  _ws_prev="$(mktemp /tmp/my-scan.w1.XXXXXX)" || err 00050 "mktemp failed."
-  _ws_cur="$(mktemp /tmp/my-scan.w2.XXXXXX)"  || err 00051 "mktemp failed."
+  _ws_prev="$(mktemp /tmp/my-scan.w1.XXXXXX)" || err 00051 "mktemp failed."
+  _ws_cur="$(mktemp /tmp/my-scan.w2.XXXXXX)"  || err 00052 "mktemp failed."
   # shellcheck disable=SC2064  # expand the paths now, not at trap time
   trap "rm -f '$_ws_prev' '$_ws_cur'; echo; exit 0" INT TERM HUP
 
@@ -2244,7 +2253,7 @@ do_cancel() {
     OCR_STATE="OCRing"
   fi
 
-  _tmp="$(mktemp /tmp/my-scan.cancel.XXXXXX)" || err 00052 "mktemp failed."
+  _tmp="$(mktemp /tmp/my-scan.cancel.XXXXXX)" || err 00053 "mktemp failed."
   cancel_list > "$_tmp"
   _n="$(awk 'NF{n++} END{print n+0}' "$_tmp" 2>/dev/null)"
 
@@ -2280,7 +2289,7 @@ do_cancel() {
       case "$_ans" in y|Y|yes|YES) ;; *) det "aborted."; rm -f "$_tmp"; return 0;; esac
     else
       rm -f "$_tmp"
-      err 00053 "'--all' needs confirmation and there is no terminal to ask. Add --yes."
+      err 00054 "'--all' needs confirmation and there is no terminal to ask. Add --yes."
     fi
   fi
 
@@ -2303,7 +2312,7 @@ do_cancel() {
       msg2 "cancelled: '${_f##*/}' -> '$T_PATH_FAILED/'"
       [ "$_st" = "OCRing" ] && det "its OCR is still running -- '$US reset' stops the machinery"
     else
-      err 00054 "FAILED [$?] to move '$_f' to '$T_PATH_FAILED/'" "-"
+      err 00055 "FAILED [$?] to move '$_f' to '$T_PATH_FAILED/'" "-"
     fi
   done < "$_tmp"
   rm -f "$_tmp"
@@ -2559,7 +2568,7 @@ setup_write_workflow() {
   case "$WORKFLOW_SHELL" in
     /bin/bash|/bin/csh|/bin/ksh|/bin/sh|/bin/tcsh|/bin/zsh) ;;
     /usr/bin/perl|/usr/bin/ruby|/usr/local/bin/python|/usr/local/bin/python3) ;;
-    *) err 00055 "WORKFLOW_SHELL '$WORKFLOW_SHELL' is not one Automator accepts. \
+    *) err 00056 "WORKFLOW_SHELL '$WORKFLOW_SHELL' is not one Automator accepts. \
 Its Run Shell Script step silently does nothing with any other shell -- no error, \
 nothing in any log. Use one of: /bin/zsh /bin/sh /bin/bash /bin/ksh /bin/csh /bin/tcsh." "-"
        return 1 ;;
@@ -2581,7 +2590,7 @@ nothing in any log. Use one of: /bin/zsh /bin/sh /bin/bash /bin/ksh /bin/csh /bi
   if [ -d "$_wf" ]; then
     _bak="$_wf.bak-$(date -u +%Y%m%dT%H%M%SZ)"
     if [ -n "$DRY_RUN" ]; then det "WOULD BACK UP the existing workflow to '$_bak'"
-    else run cp -R "$_wf" "$_bak" || { err 00056 "FAILED to back up '$_wf'" "-"; return 1; }
+    else run cp -R "$_wf" "$_bak" || { err 00057 "FAILED to back up '$_wf'" "-"; return 1; }
          det "backed the existing workflow up to '$_bak'"; fi
   fi
 
@@ -2601,7 +2610,7 @@ nothing in any log. Use one of: /bin/zsh /bin/sh /bin/bash /bin/ksh /bin/csh /bi
     return 0
   fi
 
-  mkdir -p "$_wf/Contents" || { err 00057 "FAILED to create '$_wf/Contents'" "-"; return 1; }
+  mkdir -p "$_wf/Contents" || { err 00058 "FAILED to create '$_wf/Contents'" "-"; return 1; }
 
   cat >"$_wf/Contents/Info.plist" <<_EOIP_
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2687,14 +2696,14 @@ _EOPY_
   _rc=$?
   if [ "$_rc" -ne 0 ]; then
     # the generator's own diagnosis, never a bare exit code
-    err 00058 "FAILED [$_rc] to generate '$_doc': $(tail -n 3 "$_gerr" | tr '\n' ' ')" "-"
+    err 00059 "FAILED [$_rc] to generate '$_doc': $(tail -n 3 "$_gerr" | tr '\n' ' ')" "-"
     rm -f "$_gerr"; return 1
   fi
   rm -f "$_gerr"
 
   # verify what was written rather than trusting the generator
   /usr/bin/plutil -lint "$_doc" >/dev/null 2>&1 \
-    || { err 00059 "'$_doc' is not a valid plist." "-"; return 1; }
+    || { err 00060 "'$_doc' is not a valid plist." "-"; return 1; }
   _steps="$(/usr/bin/plutil -extract actions raw -o - "$_doc" 2>/dev/null)"
   det "wrote a $_steps-step workflow, plist lints clean [0]"
   return 0
@@ -2961,7 +2970,7 @@ do_uninstall() {
 
   _gui="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
   if [ "$(id -u)" = "0" ]; then
-    err 00060 "Run '$US uninstall' as the GUI user, not as root.
+    err 00061 "Run '$US uninstall' as the GUI user, not as root.
 The Folder Action belongs to the caller's login session; as root you would be
 detaching root's, not '${_gui:-the console user}'s.
 Try:   su - ${_gui:-<the console user>} -c '$US uninstall${1:+ $1}'"
@@ -3049,14 +3058,14 @@ do_setup() {
   # like it worked -- it even used to print "for GUI user 'root'".
   _gui="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
   if [ "$(id -u)" = "0" ]; then
-    err 00061 "Run '$US setup' as the GUI user, not as root.
+    err 00062 "Run '$US setup' as the GUI user, not as root.
 It writes into \$HOME (here: '$HOME') and binds the Folder Action in the
 caller's login session -- as root, both would be root's and no scan would
 ever reach it.
 Try:   su - ${_gui:-<the console user>} -c '$US setup${1:+ $1}'"
   fi
   if [ -n "$_gui" ] && [ "$_gui" != "$(id -un)" ]; then
-    err 00062 "You are '$(id -un)' but the console (GUI) user is '$_gui'.
+    err 00063 "You are '$(id -un)' but the console (GUI) user is '$_gui'.
 The Folder Action has to belong to the user whose session the scans arrive in,
 so this would set it up for the wrong account." "-"
     det "continuing anyway -- but check the bindings it reports at the end"
@@ -3129,7 +3138,13 @@ t_world() { # $1 = dir; sets T_CONF
   cat >"$_tw/my-ocr.stub" <<'_EOSTUB_'
 #!/bin/dash
 _d="$(dirname "$0")"
-case "$1" in --status) printf '%s\n' "OCR       idle" "ENGINE    StubEngine ready" "SETTINGS  stub settings"; exit 0 ;; esac
+case "$1" in --status)
+  printf '%s\n' "OCR       idle" "ENGINE    StubEngine ready" "SETTINGS  stub settings"
+  # the types it takes: ocr.types replaces them, an empty one names none
+  if [ -f "$_d/ocr.types" ]; then _t="$(cat "$_d/ocr.types")"; else _t="PDF, JPEG, PNG, TIFF"; fi
+  [ -n "$_t" ] && printf 'TYPES     %s   [stub]\n' "$_t"
+  exit 0 ;;
+esac
 : >"$_d/ocr.called"
 _failto=""
 _rc=0
@@ -3629,24 +3644,51 @@ _EOPNG_
   fi
 }
 
-# ---- my-scan and my-ocr must accept the SAME input types ------------------
-rt_types_agree() {
-  _mo="$(sed -n 's/^MY_OCR="\(.*\)"/\1/p' <"$T_CONF" 2>/dev/null)"
-  _real="$("$0" --create-config 2>/dev/null | sed -n 's/^MY_OCR="\(.*\)"/\1/p')"
-  [ -x "$_real" ] || { t_ok "type agreement: my-ocr not installed here -- skipped"; return 0; }
-  _ours="$("$0" --create-config 2>/dev/null | sed -n 's/^ACCEPT_FILE_TYPE_REGEX="\(.*\)"/\1/p')"
-  _theirs="$(sed -n 's/^ *S_EXPECTED_FILE_TYPE___REGEX="\([^"]*\)".*/\1/p' "$_real" | head -n 1)"
-  # compare the sets, order and spacing aside
-  # shellcheck disable=SC1003  # stripping a literal backslash out of the regex
-  _a="$(printf '%s' "$_ours"   | tr -d ' \\' | tr '|' '\n' | sort | tr '\n' ',')"
-  # shellcheck disable=SC1003  # stripping a literal backslash from the regex
-  _b="$(printf '%s' "$_theirs" | tr -d ' \\' | tr '|' '\n' | sort | tr '\n' ',')"
-  if [ "$_a" = "$_b" ]; then
-    t_ok "type agreement: my-scan and my-ocr accept the same types ($_a)"
+# ---- the input types are my-ocr's to say ----------------------------------
+rt_types_from_my_ocr() {
+  _d="$T_TMP/types"; t_world "$_d"
+  # a my-ocr that takes no PDF: a sound PDF must be refused HERE, though any
+  # list of my-scan's own would take it
+  printf 'JPEG, PNG' >"$_d/ocr.types"
+  t_pdf "$_d/drop/a.pdf"
+  "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null
+  if [ -s "$_d/ocr.args" ]; then
+    t_bad "types: a type my-ocr's status does not name is filed under FAILED, never handed over" \
+      "handed to my-ocr: $(tr '\n' ' ' <"$_d/ocr.args")"
+  elif [ -z "$(find "$_d/failed" -name '*.pdf' 2>/dev/null)" ]; then
+    t_bad "types: a type my-ocr's status does not name is filed under FAILED, never handed over" \
+      "not in FAILED: $(find "$_d" -name '*.pdf' -not -path '*/.*' | tr '\n' ' ')"
   else
-    t_bad "type agreement: my-scan and my-ocr accept the same types" \
-      "my-scan=[$_a] my-ocr=[$_b] -- a type only one accepts stages then fails"
+    t_ok "types: a type my-ocr's status does not name is filed under FAILED, never handed over"
   fi
+
+  # a my-ocr that names no types: nothing is taken, and the error says why
+  _d="$T_TMP/notypes"; t_world "$_d"
+  : >"$_d/ocr.types"
+  t_pdf "$_d/drop/a.pdf"
+  _o="$("$0" --config "$T_CONF" process --all 2>&1 </dev/null)"; _rc=$?
+  case "$_rc:$_o" in
+    0:*) t_bad "types: no TYPES from my-ocr fails the run" "rc 0";;
+    *"names no TYPES"*) t_ok "types: no TYPES from my-ocr fails the run, and says so [rc $_rc]";;
+    *) t_bad "types: no TYPES from my-ocr fails the run, and says so" "$(printf '%s' "$_o" | grep ERROR)";;
+  esac
+  if [ -f "$_d/drop/a.pdf" ]; then
+    t_ok "types: ...and leaves the delivery in the drop folder for the next run"
+  else
+    t_bad "types: ...and leaves the delivery in the drop folder for the next run" "it was moved"
+  fi
+}
+
+# ---- the REAL my-ocr names its types (what the stub stands in for) --------
+rt_my_ocr_types() {
+  _real="$("$0" --create-config 2>/dev/null | sed -n 's/^MY_OCR="\(.*\)"/\1/p')"
+  [ -x "$_real" ] || { t_ok "my-ocr types: my-ocr not installed here -- skipped"; return 0; }
+  _t="$(MY_OCR="$_real" ocr_types)"
+  case " $_t " in
+    *" PDF "*) t_ok "my-ocr types: '$_real --status' names them ($_t)";;
+    *) t_bad "my-ocr types: '$_real --status' names them" \
+         "got [$_t] -- 'process' refuses to take anything until my-ocr prints a TYPES line";;
+  esac
 }
 
 # ---- the one slow line comes last ----------------------------------------
@@ -3806,7 +3848,7 @@ rt_test_mail() {
   rm -f "$_d/notify.rc"
   case "$_r|$_o" in
     0\|*) t_bad "test-mail: a failing my-notify fails the test, with its rc" "rc=0";;
-    *"ERROR 00066"*"[my-notify rc 3]"*) t_ok "test-mail: a failing my-notify fails the test, with its rc";;
+    *"ERROR 00067"*"[my-notify rc 3]"*) t_ok "test-mail: a failing my-notify fails the test, with its rc";;
     *) t_bad "test-mail: a failing my-notify fails the test, with its rc" "$(printf '%s' "$_o" | tail -n 1)";;
   esac
 
@@ -3817,7 +3859,7 @@ rt_test_mail() {
     _o="$("$0" --config "$_d/conf.off" --test-mail 2>&1 </dev/null)"; _r=$?
     case "$_r|$_o" in
       0\|*) t_bad "test-mail: NOTIFY_VIA='$_via' (mail off) fails" "rc=0 -- a passing test with mail off";;
-      *"ERROR 00063"*)
+      *"ERROR 00064"*)
         if [ -e "$_a" ]; then t_bad "test-mail: NOTIFY_VIA='$_via' (mail off) fails" "my-notify was called anyway"
         else t_ok "test-mail: NOTIFY_VIA='$_via' (mail off) fails, and sends nothing"; fi;;
       *) t_bad "test-mail: NOTIFY_VIA='$_via' (mail off) fails" "$(printf '%s' "$_o" | tail -n 1)";;
@@ -4131,7 +4173,7 @@ rt_quiet() {
   esac
 
   # my-ocr's narration must be silenced too -- but never its errors. The stub
-  # fails on a *BOOM* file, which reaches us as err 00034 on stderr.
+  # fails on a *BOOM* file, which reaches us as ERROR 00034 on stderr.
   t_pdf "$_d/drop/BOOM.pdf"
   _qo="$("$0" --config "$T_CONF" -Q -L process --all 2>&1 </dev/null)"
   case "$_qo" in
@@ -4444,7 +4486,7 @@ rt_run_list_complete() {
 # "not ok K - name" as each test ends.
 _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
   concurrent_process workflow fa_bound status_folder_action status_engine fa_live partial_delivery deep_check cleanup batching
-  picture_input types_agree status_order retry listing_not_swallowed_by_log
+  picture_input types_from_my_ocr my_ocr_types status_order retry listing_not_swallowed_by_log
   reset_delegates test_mail help_claims opt_arg_not_subcommand quiet
   counts_add_up failed_are_counted dry_run dry_run_retry dry_run_summary config_keys qpdf_autodetect
   pdfinfo_autodetect settle_giveup version_clone ignored_inputs my_ocr_suite
@@ -4482,11 +4524,11 @@ do_run_tests() { # $1 = optional FILTER
 do_test_mail() {
   case ",$NOTIFY_VIA," in
     *,mail,*) ;;
-    *) err 00063 "mail is off in '$CONFIG_FILE': NOTIFY_VIA='$NOTIFY_VIA' has no 'mail'." ;;
+    *) err 00064 "mail is off in '$CONFIG_FILE': NOTIFY_VIA='$NOTIFY_VIA' has no 'mail'." ;;
   esac
   command -v notify_mail >/dev/null 2>&1 \
-    || err 00064 "'$CONFIG_FILE' defines no notify_mail() -- it predates it; regenerate it from --create-config."
-  [ -x "$my_notify" ] || err 00065 "my_notify='$my_notify' is not executable."
+    || err 00065 "'$CONFIG_FILE' defines no notify_mail() -- it predates it; regenerate it from --create-config."
+  [ -x "$my_notify" ] || err 00066 "my_notify='$my_notify' is not executable."
 
   _tm_to="${NOTIFY_MAIL_TO:-the my-notify default recipient}"
   _tm_body="This is a test mail from '$US --test-mail'. It went out through
@@ -4500,7 +4542,7 @@ Version: $(do_version)"
 
   notify_mail "$US test mail" "$_tm_body"
   _tm_rc=$?
-  [ "$_tm_rc" -eq 0 ] || err 00066 "test mail to $_tm_to NOT sent [my-notify rc $_tm_rc]"
+  [ "$_tm_rc" -eq 0 ] || err 00067 "test mail to $_tm_to NOT sent [my-notify rc $_tm_rc]"
   msg "test mail sent to $_tm_to [my-notify rc $_tm_rc]"
   return 0
 }
@@ -4646,7 +4688,7 @@ while [ $# -gt 0 ]; do
     -w|--wait)           WAIT_FOR_ADF=1 ;;
     -d|--duplex)         WAIT_FOR_ADF=1; DUPLEX=1 ;;
     -g|--grey|--gray)    SCAN_MODE_OVERRIDE="Gray" ;;
-    -r|--resolution)     isInt "$1" || err 00067 "--resolution needs an integer, got '$1'."
+    -r|--resolution)     isInt "$1" || err 00068 "--resolution needs an integer, got '$1'."
                          SCAN_DPI_OVERRIDE="$1"; shift ;;
     --all)               CANCEL_ALL=1; RESET_ALL=1; PROCESS_ALL=1 ;;
     --retry)             PROCESS_RETRY="queue"
@@ -4688,7 +4730,7 @@ load_config
 # break every invocation of a tool whose main job has nothing to do with it.
 if [ -n "$WATCH_INTERVAL_OVERRIDE" ]; then
   isNum "$WATCH_INTERVAL_OVERRIDE" \
-    || err 00068 "--watch interval '$WATCH_INTERVAL_OVERRIDE' is not a positive number."
+    || err 00069 "--watch interval '$WATCH_INTERVAL_OVERRIDE' is not a positive number."
   WATCH_INTERVAL="$WATCH_INTERVAL_OVERRIDE"
 fi
 
@@ -4722,7 +4764,7 @@ case "${WHAT:-usage}" in
   cancel)   do_cancel "$@";  RC=$? ;;
   reset)    do_reset;        RC=$? ;;
   devices)  do_devices;       RC=$? ;;
-  *)        err 00069 "Unknown subcommand '$WHAT'. See --help." ;;
+  *)        err 00070 "Unknown subcommand '$WHAT'. See --help." ;;
 esac
 
 # the subcommand's verdict is the tool's exit status -- a caller that pipes
