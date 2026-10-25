@@ -93,14 +93,15 @@ QUEUE     fail .../02_FAILED_OCR     0 files
 FOLDERACTION ftp  my-scan.workflow attached [0]
 MY-OCR    idle
 ENGINE    DEVONthink installed, not running   [/Applications/DEVONthink.app]
-SETTINGS  languages ..., deskew on, page orientation on, ...
+SETTINGS  languages ..., deskew on, page orientation on   [...]
+ADD-ON    ABBYY OCR installed   [.../DTOCRHelper.app]
 RUNNING   <none>
 ```
 
 Every conclusion carries the value it came from, so a wrong one is visible
 without debugging. `MY-OCR` is one line from `my-ocr --status` — is the OCR
-busy, the fact you ran `status` for — and `ENGINE` / `SETTINGS` are its lines,
-verbatim. `FOLDERACTION` is my-scan's own workflow, one line per drop folder. `-V` adds my-ocr's full detail, the
+busy, the fact you ran `status` for — and `ENGINE` / `SETTINGS` / `ADD-ON` are its
+lines, verbatim. `FOLDERACTION` is my-scan's own workflow, one line per drop folder. `-V` adds my-ocr's full detail, the
 per-file settle report, the plist keys and the workflow path.
 
 `SCAN_DEVICE_USUALLY_OFF=1` makes a powered-down scanner report *not answering

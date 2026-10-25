@@ -2174,10 +2174,10 @@ do_status() {
     _p "${_pfx}MY-OCR    NOT FOUND at '$MY_OCR' -- my-scan cannot OCR anything"
   fi
 
-  # The engine is my-ocr's business: its ENGINE and SETTINGS lines, verbatim,
-  # so an engine change never touches my-scan.
+  # The engine is my-ocr's business: its ENGINE, SETTINGS and ADD-ON lines,
+  # verbatim, so an engine change never touches my-scan.
   if [ -n "$OCR_STATUS" ]; then
-    _eng="$(printf '%s\n' "$OCR_STATUS" | grep -E '^(ENGINE|SETTINGS) ')"
+    _eng="$(printf '%s\n' "$OCR_STATUS" | grep -E '^(ENGINE|SETTINGS|ADD-ON) ')"
     if [ -n "$_eng" ]; then
       printf '%s\n' "$_eng" | while IFS= read -r _el; do _p "${_pfx}$_el"; done
     else
@@ -3139,7 +3139,7 @@ t_world() { # $1 = dir; sets T_CONF
 #!/bin/dash
 _d="$(dirname "$0")"
 case "$1" in --status)
-  printf '%s\n' "OCR       idle" "ENGINE    StubEngine ready" "SETTINGS  stub settings"
+  printf '%s\n' "OCR       idle" "ENGINE    StubEngine ready" "SETTINGS  stub settings" "ADD-ON    stub add-on"
   # the types it takes: ocr.types replaces them, an empty one names none
   if [ -f "$_d/ocr.types" ]; then _t="$(cat "$_d/ocr.types")"; else _t="PDF, JPEG, PNG, TIFF"; fi
   [ -n "$_t" ] && printf 'TYPES     %s   [stub]\n' "$_t"
@@ -4394,8 +4394,10 @@ rt_status_engine() {
   _d="$T_TMP/engine"; t_world "$_d"
   _o="$("$0" --config "$T_CONF" status 2>&1 </dev/null)"
   case "$_o" in
-    *"ENGINE    StubEngine ready"*"SETTINGS  stub settings"*) t_ok "status: ENGINE and SETTINGS come from my-ocr --status";;
-    *) t_bad "status: ENGINE and SETTINGS come from my-ocr --status" "$(printf '%s\n' "$_o" | grep -e ENGINE -e OCRAPP)";;
+    *"ENGINE    StubEngine ready"*"SETTINGS  stub settings"*"ADD-ON    stub add-on"*)
+       t_ok "status: ENGINE, SETTINGS and ADD-ON come from my-ocr --status";;
+    *) t_bad "status: ENGINE, SETTINGS and ADD-ON come from my-ocr --status" \
+             "$(printf '%s\n' "$_o" | grep -e ENGINE -e SETTINGS -e ADD-ON -e OCRAPP)";;
   esac
   case "$_o" in
     *OCRAPP*|*FineReader*) t_bad "status: my-scan names no OCR application of its own" \
