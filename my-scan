@@ -1201,6 +1201,7 @@ queue_detail() { # $1 = dir, $2 = line prefix
       ok)     _p "${_qd_pfx}          | ok     $(printf '%5s' "${2:-?}")p  ${_qd_f##*/}" ;;
       broken) _p "${_qd_pfx}          | BROKEN      -  ${_qd_f##*/}" ;;
       empty)  _p "${_qd_pfx}          | EMPTY       -  ${_qd_f##*/}" ;;
+      unknown) _p "${_qd_pfx}          | ?           -  ${_qd_f##*/}   (no pdfinfo to read it)" ;;
       *)      _p "${_qd_pfx}          | other       -  ${_qd_f##*/}" ;;
     esac
   done
@@ -1210,13 +1211,16 @@ queue_detail() { # $1 = dir, $2 = line prefix
 # What IS this file? "failed" lumps together things that need different
 # answers: an empty file is a delivery that never arrived, a broken one is a
 # damaged document, and a Finder dropping is not a document at all.
-#   ok <pages> | broken | empty | other
+#   ok <pages> | broken | empty | other | unknown (a PDF, and no pdfinfo to ask)
 classify_file() { # $1 = file
   [ -e "$1" ] || { printf 'other\n'; return 0; }
   case "${1##*/}" in .*) printf 'other\n'; return 0 ;; esac   # .DS_Store, sidecars
   [ -s "$1" ] || { printf 'empty\n'; return 0; }
   case "$(file --brief "$1" 2>/dev/null | cut -f1 -d' ')" in
     PDF)
+      # found HERE, not left to the caller: every caller runs this inside a
+      # $(...), where a pdfinfo another $(...) found never arrives
+      find_pdfinfo >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
       _cf_p="$("$c_pdfinfo" "$1" 2>/dev/null | awk '/^Pages:/{print $2; exit}')"
       case "$_cf_p" in
         ''|*[!0-9]*|0) printf 'broken\n' ;;                   # pdfinfo cannot read it
@@ -4037,6 +4041,26 @@ rt_pdfinfo_autodetect() {
   case "$_o2" in
     *"cannot count pages"*) t_ok "no pdfinfo at all: it says so, instead of calling 2 files BROKEN";;
     *) t_bad "no pdfinfo at all: it says so, instead of calling 2 files BROKEN" "got '$_o2'";;
+  esac
+
+  # The per-file LIST of '-V status', with c_pdfinfo unset as the shipped
+  # config has it: the count above finds pdfinfo inside a $(...), and that
+  # finding never reaches the list printed after it.
+  _w="$T_TMP/pdfinfolist"; t_world "$_w"
+  t_pdf "$_w/done/sound.pdf"
+  sed -e 's|^c_pdfinfo=.*|c_pdfinfo=""|' "$T_CONF" >"$_w/conf.nopath"
+  _o3="$("$0" --config "$_w/conf.nopath" -V status 2>&1 </dev/null | grep 'sound.pdf')"
+  case "$_o3" in
+    *"| ok "*) t_ok "-V status lists a sound PDF as ok with c_pdfinfo unset";;
+    *) t_bad "-V status lists a sound PDF as ok with c_pdfinfo unset" "got '$_o3'";;
+  esac
+  # ...and the classifier never calls a file broken without pdfinfo to ask
+  # shellcheck disable=SC2123  # deliberate, as above: ONLY pdfinfo is gone
+  _o4="$( c_pdfinfo="/nonexistent/pdfinfo"; PDFINFO_SEARCH="/nonexistent/pdfinfo"
+          PATH="/usr/bin:/bin"; PDFINFO_WARNED=""; classify_file "$_d/a.pdf" 2>/dev/null )"
+  case "$_o4" in
+    broken*) t_bad "no pdfinfo: a PDF is 'unknown', never 'broken'" "got '$_o4'";;
+    *)       t_ok "no pdfinfo: a PDF is '$_o4', never 'broken'";;
   esac
 }
 
