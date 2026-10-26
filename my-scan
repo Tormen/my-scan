@@ -3637,15 +3637,24 @@ png = (b"\x89PNG\r\n\x1a\n"
        + chunk(b"IEND", b""))
 open(sys.argv[1], "wb").write(png)
 _EOPNG_
-  # ...and a JPEG, the other format a scanner actually emits
-  printf '\377\330\377\340\000\020JFIF\000\001\001\000\000\001\000\001\000\000\377\333\000C\000' >"$_d/drop/photo.jpg"
-  printf '%s' "$(printf '\010%.0s' $(seq 1 64))" >>"$_d/drop/photo.jpg"
-  printf '\377\300\000\013\010\000\001\000\001\001\021\000\377\311\000\013\001\000\000\000\000\000\000\000\000\377\332\000\010\001\001\000\000?\000\324\077\377\331' >>"$_d/drop/photo.jpg"
+  # ...and a JPEG, the other format a scanner actually emits -- a REAL one,
+  # converted from that PNG: a hand-made one never parsed, so it sat out the
+  # whole settle timeout and was then quarantined, and the test passed anyway
+  _jpg=""
+  if [ -x /usr/bin/sips ] \
+     && /usr/bin/sips -s format jpeg "$_d/drop/shot.png" --out "$_d/photo.jpg" >/dev/null 2>&1; then
+    mv "$_d/photo.jpg" "$_d/drop/photo.jpg"; _jpg=1
+  fi
   "$0" --config "$T_CONF" process --all >/dev/null 2>&1 </dev/null
-  case "$(file --brief "$_d/done"/*photo* 2>/dev/null)$(file --brief "$_d/failed"/*photo* 2>/dev/null)" in
-    JPEG*) t_ok "pictures: a JPEG is accepted as input too";;
-    *)     t_ok "pictures: JPEG fixture not recognised here -- accept-list still lists JPEG";;
-  esac
+  if [ -z "$_jpg" ]; then
+    t_ok "pictures: no sips here to make a JPEG -- the JPEG case is skipped"
+  elif [ -n "$(find "$_d/done" -name '*photo*' 2>/dev/null)" ]; then
+    t_ok "pictures: a JPEG is accepted and goes through"
+  else
+    _w="$(find "$_d/failed" -name '*photo*' 2>/dev/null)"
+    t_bad "pictures: a JPEG is accepted and goes through" \
+      "${_w:+quarantined: }${_w:-it vanished} -- my-ocr accepts JPEG, my-scan must too"
+  fi
   if [ -n "$(find "$_d/done" -name '*shot*' 2>/dev/null)" ]; then
     t_ok "pictures: a PNG is accepted and goes through (1 picture = 1 page)"
   else
