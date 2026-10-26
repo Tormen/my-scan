@@ -725,10 +725,12 @@ settle_writer_busy() { # $1 = file. 0 = a writer still holds it.
   _lsof_pid=$!
   _lsof_max="$SETTLE_LSOF_TIMEOUT"
   isInt "$_lsof_max" || _lsof_max=10
+  # looked at every tenth of a second: lsof answers in hundredths, and a
+  # whole-second look made every writer check cost a second
   _w=0
   while kill -0 "$_lsof_pid" 2>/dev/null; do
-    [ "$_w" -ge "$_lsof_max" ] && break
-    sleep 1
+    [ "$_w" -ge $(( _lsof_max * 10 )) ] && break
+    sleep 0.1
     _w=$(( _w + 1 ))
   done
   if kill -0 "$_lsof_pid" 2>/dev/null; then
@@ -810,8 +812,12 @@ settle_check() {
 
 # WAIT until settled. Used by process, which must not touch a delivery
 # that is still arriving.
+# Every duration here is WALL CLOCK since the wait began: the checks between
+# the sleeps take time too, and counting the sleeps alone once made a 20s
+# timeout last 41s.
 settle_file() { # $1 = file. 0 = settled, 1 = timed out.
-  _f="$1"; _i=0; _stable=0; _last=""; _unparse=0; _said=-1
+  _f="$1"; _i=0; _stable=0; _last=""; _unparse=0; _unp_t0=""; _said=0
+  _t0="$(date +%s)"
   _giveup="$SETTLE_UNPARSEABLE_GIVEUP"; isInt "$_giveup" || _giveup=0
   dbg "settle_file('$_f'): timeout=${SETTLE_TIMEOUT}s poll=${SETTLE_POLL}s stable=${SETTLE_STABLE_POLLS} giveup=${_giveup}s"
   vdet "waiting until no SMB/FTP writer holds it, its size stops changing, and it parses"
@@ -834,26 +840,27 @@ settle_file() { # $1 = file. 0 = settled, 1 = timed out.
       # nobody is writing, and a slow transfer would be failed as broken.
       case "$SETTLE_REASON" in
         "size steady but it does not parse yet")
-          _unparse=$(( _unparse + SETTLE_POLL ))
+          [ -n "$_unp_t0" ] || _unp_t0="$(date +%s)"
+          _unparse=$(( $(date +%s) - _unp_t0 ))
           if [ "$_giveup" -gt 0 ] && [ "$SETTLE_WRITER_CHECKED" = "1" ] \
              && [ "$_unparse" -ge "$_giveup" ]; then
             SETTLE_REASON="no writer holds it and its size is steady, but it does not parse -- damaged, not still arriving"
             err 00021 "GAVE UP after ${_unparse}s on '$_f' -- $SETTLE_REASON" "-"
             return 1
           fi ;;
-        *) _unparse=0 ;;
+        *) _unparse=0; _unp_t0="" ;;
       esac
     fi
     _last="$SETTLE_SIZE"
     ddbg "settle [$_i/$SETTLE_TIMEOUT] '$_f': $SETTLE_REASON"
     # A long wait must show life at -V. Without this, a 600s settle is
     # indistinguishable from a hang -- the per-poll line is -DD only.
-    if [ "$_i" -gt 0 ] && [ "$_said" != "$_i" ] && [ $(( _i % 30 )) -lt "$SETTLE_POLL" ]; then
+    if [ $(( _i - _said )) -ge 30 ]; then
       _said="$_i"
       vdet "still waiting (${_i}s of ${SETTLE_TIMEOUT}s): $SETTLE_REASON"
     fi
     sleep "$SETTLE_POLL"
-    _i=$(( _i + SETTLE_POLL ))
+    _i=$(( $(date +%s) - _t0 ))
   done
 
   err 00022 "TIMEOUT [${SETTLE_TIMEOUT}s] settling '$_f' -- $SETTLE_REASON" "-"
@@ -4099,6 +4106,47 @@ rt_settle_giveup() {
   esac
 }
 
+# Settle's clock is the wall clock. Its poll loop once counted only its own
+# sleeps, so every second the checks took came on top: a 20s timeout lasted
+# 41s, and every writer check waited a full second for an lsof that answers
+# in 0.03s.
+rt_settle_clock() {
+  # (a) the writer check returns when lsof does, not on the next whole second
+  if find_lsof; then
+    printf 'x' >"$T_TMP/quiet.pdf"
+    _t0="$(date +%s)"
+    for _n in 1 2 3 4 5; do settle_writer_busy "$T_TMP/quiet.pdf"; done
+    _el=$(( $(date +%s) - _t0 ))
+    if [ "$_el" -lt 3 ]; then
+      t_ok "settle: five writer checks take ${_el}s, not a second each"
+    else
+      t_bad "settle: five writer checks take under 3s" "took ${_el}s -- each waits out a whole second"
+    fi
+  else
+    t_ok "settle: no lsof here -- the writer-check timing is skipped"
+  fi
+
+  # (b) a slow check counts against SETTLE_TIMEOUT: an lsof that takes 3s,
+  # a 4s timeout, a delivery that never parses -- the wait ends after ~4s of
+  # wall clock, where counting sleeps alone made it 4 rounds of 3s + 1s
+  _d="$T_TMP/clock"; t_world "$_d"
+  printf '#!/bin/dash\nsleep 3\n' >"$_d/lsof.slow"; chmod +x "$_d/lsof.slow"
+  sed -e "s|^c_lsof=.*|c_lsof=\"$_d/lsof.slow\"|" \
+      -e 's|^SETTLE_TIMEOUT=.*|SETTLE_TIMEOUT=4|' \
+      -e 's|^SETTLE_POLL=.*|SETTLE_POLL=1|' \
+      -e 's|^SETTLE_UNPARSEABLE_GIVEUP=.*|SETTLE_UNPARSEABLE_GIVEUP=0|' "$T_CONF" >"$_d/conf.slow"
+  printf '%%PDF-1.4\ngarbage that is not a real pdf body\n' >"$_d/drop/corrupt.pdf"
+  _t0="$(date +%s)"
+  "$0" --config "$_d/conf.slow" process --all >/dev/null 2>&1 </dev/null
+  _el=$(( $(date +%s) - _t0 ))
+  if [ "$_el" -lt 11 ]; then
+    t_ok "settle: a 4s SETTLE_TIMEOUT ends after ${_el}s of wall clock, slow checks included"
+  else
+    t_bad "settle: a 4s SETTLE_TIMEOUT ends within 11s of wall clock" \
+          "took ${_el}s -- the timeout counts sleeps only, not the checks between them"
+  fi
+}
+
 # Documentation is not executed, so it rots silently. my-ocr has had this
 # check for a while; my-scan did not, which is how a --dry-run documented as
 # "change nothing" could go on staging, moving and OCRing for as long as it did.
@@ -4496,7 +4544,7 @@ _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
   picture_input types_from_my_ocr my_ocr_types status_order retry listing_not_swallowed_by_log
   reset_delegates test_mail help_claims opt_arg_not_subcommand quiet
   counts_add_up failed_are_counted dry_run dry_run_retry dry_run_summary config_keys qpdf_autodetect
-  pdfinfo_autodetect settle_giveup version_clone ignored_inputs
+  pdfinfo_autodetect settle_giveup settle_clock version_clone ignored_inputs
   err_codes run_list_complete"
 
 # The tests that read or attach the user's REAL Folder Actions: one lane, in
