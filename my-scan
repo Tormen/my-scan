@@ -4509,7 +4509,7 @@ rt_run_list_complete() {
 
 # The tests, in order: one function per area, rt_<name>; FILTER picks the tests
 # whose name contains it. TAP-style: "1..N" first, then "ok K - name" /
-# "not ok K - name" as each test ends.
+# "not ok K - name" as each test ends, and "# <seconds>s <name>" after it.
 _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
   concurrent_process workflow fa_bound status_folder_action status_engine fa_live partial_delivery deep_check cleanup batching
   picture_input types_from_my_ocr my_ocr_types status_order retry listing_not_swallowed_by_log
@@ -4530,9 +4530,10 @@ do_run_tests() { # $1 = optional FILTER
   _rt_k=0
   for _rt_t in $_rt_all; do
     case "$_rt_t" in *"$_rt_filter"*) ;; *) continue ;; esac
-    _rt_k=$(( _rt_k + 1 )); _rt_bad=$T_FAIL
+    _rt_k=$(( _rt_k + 1 )); _rt_bad=$T_FAIL; _rt_t0="$(date +%s)"
     "rt_$_rt_t"
     if [ "$T_FAIL" = "$_rt_bad" ]; then echo "ok $_rt_k - $_rt_t"; else echo "not ok $_rt_k - $_rt_t"; fi
+    echo "# $(( $(date +%s) - _rt_t0 ))s $_rt_t"
   done
   rm -rf "$T_TMP"
   _p "  ----"
