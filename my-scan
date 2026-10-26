@@ -4489,7 +4489,8 @@ rt_run_list_complete() {
 
 # The tests, in order: one function per area, rt_<name>; FILTER picks the tests
 # whose name contains it. TAP-style: "1..N" first, then "ok K - name" /
-# "not ok K - name" as each test ends, and "# <seconds>s <name>" after it.
+# "not ok K - name" as each test ends -- in parallel, so in any order (see
+# do_run_tests) -- and "# <seconds>s <name>" after it.
 _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
   concurrent_process workflow fa_bound status_folder_action status_engine fa_live partial_delivery deep_check cleanup batching
   picture_input types_from_my_ocr my_ocr_types status_order retry listing_not_swallowed_by_log
@@ -4498,24 +4499,83 @@ _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
   pdfinfo_autodetect settle_giveup version_clone ignored_inputs
   err_codes run_list_complete"
 
+# The tests that read or attach the user's REAL Folder Actions: one lane, in
+# list order, because there is one Folder Actions setup per user.
+_rt_serial="workflow fa_bound status_folder_action fa_live"
+
+# A process and everything it started, children first.
+rt_kill_tree() { # $1 = pid
+  for _rkt_c in $(ps -A -o pid= -o ppid= | awk -v p="$1" '$2 == p { print $1 }'); do
+    rt_kill_tree "$_rkt_c"
+  done
+  kill "$1" 2>/dev/null
+}
+
+# Ctrl-C or a TERM from my-rollout's timeout: every lane stops, nothing is left.
+rt_abort() { # $1 = exit code: 130 for Ctrl-C, 143 for TERM
+  for _rt_kp in $_rt_pids; do rt_kill_tree "$_rt_kp"; done
+  rm -rf "$_rt_root"
+  echo "my-scan --run-tests: interrupted -- no verdict" >&2
+  exit "$1"
+}
+
+# One test, in a world of its own: its detail and its TAP line go out as ONE
+# block when it ends, so lanes running side by side never interleave lines.
+rt_one() { # $1 = number, $2 = name
+  T_TMP="$_rt_root/$1"; mkdir "$T_TMP"
+  T_PASS=0; T_FAIL=0; _rt_t0="$(date +%s)"
+  "rt_$2" >"$_rt_root/$1.out" 2>&1
+  _rt_el=$(( $(date +%s) - _rt_t0 ))
+  printf '%s %s\n' "$T_PASS" "$T_FAIL" >"$_rt_root/$1.cnt"
+  if [ "$T_FAIL" -eq 0 ]; then _rt_v="ok"; else _rt_v="not ok"; fi
+  until mkdir "$_rt_root/.print" 2>/dev/null; do sleep 0.05; done
+  cat "$_rt_root/$1.out"
+  printf '%s %s - %s\n# %ss %s\n' "$_rt_v" "$1" "$2" "$_rt_el" "$2"
+  rmdir "$_rt_root/.print"
+}
+
 do_run_tests() { # $1 = optional FILTER
   _rt_filter="$1"
-  _rt_n=0
+  _rt_sel=""; _rt_n=0
   for _rt_t in $_rt_all; do
-    case "$_rt_t" in *"$_rt_filter"*) _rt_n=$(( _rt_n + 1 )) ;; esac
+    case "$_rt_t" in *"$_rt_filter"*) _rt_n=$(( _rt_n + 1 )); _rt_sel="$_rt_sel $_rt_n:$_rt_t" ;; esac
   done
   echo "1..$_rt_n"
-  _p "$US --run-tests${_rt_filter:+ $_rt_filter}   ($(head -1 "$0"))"
-  T_TMP="$(mktemp -d /tmp/my-scan.tests.XXXXXX)" || { _p "mktemp failed"; return 1; }
-  _rt_k=0
-  for _rt_t in $_rt_all; do
-    case "$_rt_t" in *"$_rt_filter"*) ;; *) continue ;; esac
-    _rt_k=$(( _rt_k + 1 )); _rt_bad=$T_FAIL; _rt_t0="$(date +%s)"
-    "rt_$_rt_t"
-    if [ "$T_FAIL" = "$_rt_bad" ]; then echo "ok $_rt_k - $_rt_t"; else echo "not ok $_rt_k - $_rt_t"; fi
-    echo "# $(( $(date +%s) - _rt_t0 ))s $_rt_t"
+  _p "$US --run-tests${_rt_filter:+ $_rt_filter}   ($(head -n 1 "$0"))"
+  _rt_root="$(mktemp -d /tmp/my-scan.tests.XXXXXX)" || { _p "mktemp failed"; return 1; }
+
+  # Parallel blocks: the serial lane, plus one lane per core for the rest,
+  # dealt round-robin. A test keeps its number from the list, so the TAP lines
+  # are the same whatever order they finish in.
+  _rt_w="$(getconf _NPROCESSORS_ONLN 2>/dev/null)"; isInt "$_rt_w" || _rt_w=1
+  _rt_lane_s=""; _rt_i=0
+  for _rt_e in $_rt_sel; do
+    case " $_rt_serial " in
+      *" ${_rt_e#*:} "*) _rt_lane_s="$_rt_lane_s $_rt_e" ;;
+      *) _rt_i=$(( _rt_i + 1 )); _rt_l=$(( _rt_i % _rt_w ))
+         eval "_rt_lane_$_rt_l=\"\${_rt_lane_$_rt_l:-} $_rt_e\"" ;;
+    esac
   done
-  rm -rf "$T_TMP"
+
+  _rt_pids=""
+  trap 'rt_abort 130' INT; trap 'rt_abort 143' TERM
+  _rt_l=-1
+  while [ "$_rt_l" -lt "$_rt_w" ]; do
+    if [ "$_rt_l" -lt 0 ]; then _rt_lane="$_rt_lane_s"; else eval "_rt_lane=\"\${_rt_lane_$_rt_l:-}\""; fi
+    _rt_l=$(( _rt_l + 1 ))
+    [ -n "$_rt_lane" ] || continue
+    ( for _rt_e in $_rt_lane; do rt_one "${_rt_e%%:*}" "${_rt_e#*:}"; done ) &
+    _rt_pids="$_rt_pids $!"
+  done
+  wait
+  trap - INT TERM
+
+  T_PASS=0; T_FAIL=0
+  for _rt_e in $_rt_sel; do
+    read -r _rt_p _rt_f <"$_rt_root/${_rt_e%%:*}.cnt" || { _rt_p=0; _rt_f=1; }
+    T_PASS=$(( T_PASS + _rt_p )); T_FAIL=$(( T_FAIL + _rt_f ))
+  done
+  rm -rf "$_rt_root"
   _p "  ----"
   printf '  %d passed, %d failed\n' "$T_PASS" "$T_FAIL"
   [ "$T_FAIL" -eq 0 ]
@@ -4599,9 +4659,11 @@ OPTIONS:
   --version                 Print version, commit and build id
   --run-tests [<FILTER>]    Run the regression suite -- every stage of my-scan
                             against temp dirs and a stub my-ocr. Starts no
-                            scan and no OCR. FILTER runs
-                            only the tests whose name contains it. Prints
-                            "1..N" first, then "ok K - name" per test.
+                            scan and no OCR. FILTER runs only the tests whose
+                            name contains it. Tests run in parallel, one per
+                            core (those using the real Folder Actions one after
+                            another). Prints "1..N" first, then "ok K - name"
+                            and "# <seconds>s name" as each test ends.
   --test-mail               Send ONE test mail the way the alerts go (NOTIFY_VIA,
                             NOTIFY_MAIL_TO/_FROM, my_notify) and exit. Fails when
                             mail is off in the config or my-notify fails.
