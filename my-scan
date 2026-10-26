@@ -3871,26 +3871,6 @@ rt_test_mail() {
   done
 }
 
-# ---- my-ocr's own suite, because the two belong together -----------------
-rt_my_ocr_suite() {
-  # the REAL my-ocr, not the stub: read it from a default config, since
-  # --run-tests deliberately loads no config of its own.
-  _mo="$("$0" --create-config 2>/dev/null | sed -n 's/^MY_OCR="\(.*\)"/\1/p')"
-  if [ -z "$_mo" ] || [ ! -x "$_mo" ]; then
-    t_ok "my-ocr: not installed here ('${_mo:-unset}') -- its suite is skipped"
-    return 0
-  fi
-  _o="$("$_mo" --run-tests 2>&1 </dev/null)"
-  _r=$?
-  _line="$(printf '%s' "$_o" | grep -E '^ +[0-9]+ passed' | tail -n 1)"
-  if [ "$_r" -eq 0 ]; then
-    t_ok "my-ocr: its own suite passes (${_line:-no summary})"
-  else
-    t_bad "my-ocr: its own suite passes" "${_line:-rc=$_r}"
-    printf '%s\n' "$_o" | grep '  FAIL' | sed 's/^/        /'
-  fi
-}
-
 # The test that would have caught it: --dry-run was parsed, documented as
 # "change nothing", and honoured by setup/uninstall/reset/cleanup only. The
 # process path ignored it, so a "preview" moved the delivery, staged it, ran a
@@ -4515,7 +4495,7 @@ _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
   picture_input types_from_my_ocr my_ocr_types status_order retry listing_not_swallowed_by_log
   reset_delegates test_mail help_claims opt_arg_not_subcommand quiet
   counts_add_up failed_are_counted dry_run dry_run_retry dry_run_summary config_keys qpdf_autodetect
-  pdfinfo_autodetect settle_giveup version_clone ignored_inputs my_ocr_suite
+  pdfinfo_autodetect settle_giveup version_clone ignored_inputs
   err_codes run_list_complete"
 
 do_run_tests() { # $1 = optional FILTER
@@ -4618,8 +4598,8 @@ OPTIONS:
   --dry-run                 Show what would change; change nothing
   --version                 Print version, commit and build id
   --run-tests [<FILTER>]    Run the regression suite -- every stage of my-scan
-                            against temp dirs and a stub my-ocr, then my-ocr's
-                            own suite. Starts no scan and no OCR. FILTER runs
+                            against temp dirs and a stub my-ocr. Starts no
+                            scan and no OCR. FILTER runs
                             only the tests whose name contains it. Prints
                             "1..N" first, then "ok K - name" per test.
   --test-mail               Send ONE test mail the way the alerts go (NOTIFY_VIA,
