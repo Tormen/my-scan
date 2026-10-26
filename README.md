@@ -38,8 +38,15 @@ and run one Automator step:
         2. check     -- a light file-type check
         3. name      -- <mtime>___<original>.pdf
         4. my-ocr <the whole batch>        <- blocks until it is our turn
-        5. file      -- what my-ocr hands back
+        5. file      -- what my-ocr hands back, into T_PATH_DONE
+        6. my-docs file --rules-only <it>  <- filed by the rules, or it waits
 ```
+
+Step 6 runs once a scan has a text layer, so a rule can match on its text.
+`--rules-only`: my-docs never asks, even when `process` runs in a terminal.
+A scan no rule matches stays in `T_PATH_DONE` -- my-docs' intake there --
+for a later interactive `my-docs file`; that is not a failure. A refusal by
+my-docs is its own ERROR line in the log. `MY_DOCS=""` turns step 6 off.
 
 ## What my-scan does and does not own
 
