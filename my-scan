@@ -3163,6 +3163,13 @@ T_PASS=0; T_FAIL=0
 t_ok()  { T_PASS=$(( T_PASS + 1 )); printf '  ok    %s\n' "$1"; }
 t_bad() { T_FAIL=$(( T_FAIL + 1 )); printf '  FAIL  %s\n' "$1"
           [ -n "$2" ] && printf '        %s\n' "$2"; return 0; }
+# The code of the err call whose message starts with $1, read from this file:
+# a renumbering moves the codes, and a code written into a test went stale
+# twice. '?' when there is no such call, which no output can match.
+t_code() { # $1 = the start of the message, as written in the source
+  _tc="$(grep -F "\"$1" "$0" | sed -n 's/.*err \(0[0-9]\{4\}\) ".*/\1/p' | head -n 1)"
+  printf '%s\n' "${_tc:-?}"
+}
 
 # A throw-away pipeline: drop/queue/done/failed dirs, a config, a stub my-ocr.
 t_world() { # $1 = dir; sets T_CONF
@@ -3906,20 +3913,22 @@ rt_test_mail() {
   rm -f "$_a"; echo 3 >"$_d/notify.rc"
   _o="$("$0" --config "$_d/conf.mail" --test-mail 2>&1 </dev/null)"; _r=$?
   rm -f "$_d/notify.rc"
+  _ec="$(t_code 'test mail to')"
   case "$_r|$_o" in
     0\|*) t_bad "test-mail: a failing my-notify fails the test, with its rc" "rc=0";;
-    *"ERROR 00067"*"[my-notify rc 3]"*) t_ok "test-mail: a failing my-notify fails the test, with its rc";;
+    *"ERROR $_ec"*"[my-notify rc 3]"*) t_ok "test-mail: a failing my-notify fails the test, with its rc";;
     *) t_bad "test-mail: a failing my-notify fails the test, with its rc" "$(printf '%s' "$_o" | tail -n 1)";;
   esac
 
   # mail switched off: a FAILURE, and nothing is sent at all
+  _ec="$(t_code 'mail is off in')"
   for _via in notify ""; do
     rm -f "$_a"
     sed -e "s|^NOTIFY_VIA=.*|NOTIFY_VIA=\"$_via\"|" "$_d/conf.mail" >"$_d/conf.off"
     _o="$("$0" --config "$_d/conf.off" --test-mail 2>&1 </dev/null)"; _r=$?
     case "$_r|$_o" in
       0\|*) t_bad "test-mail: NOTIFY_VIA='$_via' (mail off) fails" "rc=0 -- a passing test with mail off";;
-      *"ERROR 00064"*)
+      *"ERROR $_ec"*)
         if [ -e "$_a" ]; then t_bad "test-mail: NOTIFY_VIA='$_via' (mail off) fails" "my-notify was called anyway"
         else t_ok "test-mail: NOTIFY_VIA='$_via' (mail off) fails, and sends nothing"; fi;;
       *) t_bad "test-mail: NOTIFY_VIA='$_via' (mail off) fails" "$(printf '%s' "$_o" | tail -n 1)";;
@@ -4317,11 +4326,13 @@ rt_quiet() {
   esac
 
   # my-ocr's narration must be silenced too -- but never its errors. The stub
-  # fails on a *BOOM* file, which reaches us as ERROR 00034 on stderr.
+  # fails on a *BOOM* file, which reaches us as the ERROR of its failed call.
   t_pdf "$_d/drop/BOOM.pdf"
   _qo="$("$0" --config "$T_CONF" -Q -L process --all 2>&1 </dev/null)"
+  # shellcheck disable=SC2016  # the $ is literal: the message as the source spells it
+  _ec="$(t_code '$MY_OCR failed')"
   case "$_qo" in
-    *"ERROR 00034"*) t_ok "-Q keeps my-ocr's failure visible (stderr survives the silence)";;
+    *"ERROR $_ec"*) t_ok "-Q keeps my-ocr's failure visible (stderr survives the silence)";;
     *) t_bad "-Q keeps my-ocr's failure visible (stderr survives the silence)" \
              "a failing OCR was swallowed: $(printf '%s' "$_qo" | head -n 1)";;
   esac
