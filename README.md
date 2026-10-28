@@ -42,6 +42,16 @@ and run one Automator step:
         6. my-docs file --rules-only <it>  <- filed by the rules, or it waits
 ```
 
+**A Folder Action, never a LaunchDaemon.** `my-scan.workflow` is an Automator
+workflow, and `/usr/bin/automator` only hands a workflow to Automator Runner,
+a helper that exists only inside the user's GUI login session. From a job in
+`/Library/LaunchDaemons` -- the system context, `UserName` or not -- it exits
+255, "Couldn't communicate with a helper application" (ada, 2026-09-02: the old
+`eu.no-panic.folderAction_my-ocr`). So the drop folder is watched by macOS
+Folder Actions, in the session; the old launchd jobs that ran a pick-up
+workflow through `automator` (`eu.no-panic.folderAction_scans-pickup`) cannot
+work and are retired.
+
 Step 6 runs once a scan has a text layer, so a rule can match on its text.
 `--rules-only`: my-docs never asks, even when `process` runs in a terminal.
 A scan no rule matches stays in `T_PATH_DONE` -- my-docs' intake there --
