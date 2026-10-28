@@ -48,9 +48,8 @@ a helper that exists only inside the user's GUI login session. From a job in
 `/Library/LaunchDaemons` -- the system context, `UserName` or not -- it exits
 255, "Couldn't communicate with a helper application" (ada, 2026-09-02: the old
 `eu.no-panic.folderAction_my-ocr`). So the drop folder is watched by macOS
-Folder Actions, in the session; the old launchd jobs that ran a pick-up
-workflow through `automator` (`eu.no-panic.folderAction_scans-pickup`) cannot
-work and are retired.
+Folder Actions, in the session; a launchd job that runs a pick-up workflow
+through `automator` (`eu.no-panic.folderAction_scans-pickup`) cannot work.
 
 Step 6 runs once a scan has a text layer, so a rule can match on its text.
 `--rules-only`: my-docs never asks, even when `process` runs in a terminal.
