@@ -333,6 +333,15 @@ After an attach it reads the bindings back and prints what Folder Actions
 Setup should show, marking its own. If macOS refuses on Automation permission it names the
 setting to change and gives the manual route.
 
+**The first scan asks for one more grant, and setup cannot ask for it.** The
+Folder Action runs `FolderActionsDispatcher.app`, so its first OCR raises
+"FolderActionsDispatcher.app wants access to control DEVONthink.app" on the
+console. Only the dispatcher itself can raise that dialog, so drop the first
+document while someone is at the screen and click **Allow**. "Don't Allow"
+makes every later OCR fail (`-1743`, the scan lands in the FAILED queue);
+undo it in System Settings → Privacy & Security → Automation →
+FolderActionsDispatcher → DEVONthink.
+
 `uninstall` removes **only what setup put in**: its own Folder Action script
 and the workflow setup generated (to the Trash, so it stays recoverable).
 Another tool's script on the same folder is left alone, and the folder action
