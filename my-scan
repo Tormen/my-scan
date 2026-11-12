@@ -8,20 +8,21 @@
 #   my-scan-processor-macos                 -> 'process' (OCR now goes to my-ocr)
 #   my-scan-processor-macos___wait-for-ocr  -> 'watch'   (OCR deblock watchdog)
 #
-# 092 == highest used errCode
+# 00073 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="aadf403"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="f37a18c"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.1-17-gaadf403"
+SCRIPT_RELEASE="v1.1-23-gf37a18c"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="e0bc3fc"
+SCRIPT_PARENT="ab18a66"
 
 US="${0##*/}"
+SITE_CONF="/LINKS/default/site.conf"   # the ONE site path in this tool: read_site
 
 PID="$(/usr/bin/printf "%06d" "$$")"   # IDENTITY: goes into lock names and "___,ID,<pid>"
 LOGPFX="$PID"                          # LOG COLUMN only; the watchdog widens it
@@ -172,18 +173,21 @@ cat <<'_EOCONF_'
 # Search order (first existing wins):
 #   $MY_SCAN_CONFIG                     env var, escape hatch for CI / tests
 #   --config <FILE>                     explicit, bypasses the search
-#   /LINKS/default/my-scan              primary system-wide location
+#   $CONFIG_SEARCH_DIR/my-scan.conf     the site's location (site.conf), then
+#   $CONFIG_SEARCH_DIR/my-scan          the bare name there
 #   ~/.my-scan.conf                     per-user override
 #   /etc/my-scan.conf                   system default
 #   /usr/local/etc/my-scan.conf         fallback
 #
 # Every runtime-tunable value lives here. The script body carries no defaults.
+# LOG_BASE_DIR and DATA_BASE_DIR come from the site file, read before this one
+# (/var/log and /var/db without it).
 
 WHOAMI="$(/usr/bin/whoami)"
 
 ##### LOGGING / NOTIFICATION ################################################
 
-LOG="/var/log/mine/$WHOAMI/my-scan.log"   # "" turns the logfile off
+LOG="$LOG_BASE_DIR/$WHOAMI/my-scan.log"   # "" turns the logfile off
 NFY=""                                    # 1 = notify (my-notify) on error
 my_notify="/LINKS/bin/my-notify"
 
@@ -219,7 +223,7 @@ IGNORE_FILENAME_PATTERNS=".* @eaDir *~ *.part *.crdownload"
 # for anything Spotlight has not indexed -- which is the interesting folders.
 # So cache instead, keyed by size+mtime: a document that has not changed is
 # never counted twice, and 'status' stays fast after its first run.
-PAGE_CACHE="/var/lib/mine/$WHOAMI/my-scan.pagecache"   # "" disables the cache
+PAGE_CACHE="$DATA_BASE_DIR/$WHOAMI/my-scan.pagecache"   # "" disables the cache
 PAGE_CACHE_MAX=5000                       # lines; pruned oldest-first past this
 
 # One way out to a person, honouring NOTIFY_VIA. my-notify's --mail takes 1-4
@@ -453,16 +457,55 @@ c_lsof_opts="-b -w -n -P"
 _EOCONF_
 }
 
-config_search_list() {
-  # both spellings are accepted under /LINKS/default: .conf first, then bare
-  _p "/LINKS/default/my-scan.conf"
-  _p "/LINKS/default/my-scan"
-  _p "$HOME/.my-scan.conf"
-  _p "/etc/my-scan.conf"
-  _p "/usr/local/etc/my-scan.conf"
+# The site's values for every tool, from SITE_CONF -- the one site path this
+# tool knows -- read before its own config: the base directories, where a
+# config is searched and where one is offered. The neutral values first, so
+# an exported variable never takes their place; then the file, plain
+# KEY="value" lines, when it is there.
+read_site() {
+  DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"
+  CONFIG_SEARCH_DIR=""; CONFIG_OFFER_DIR=""; CONFIG_OFFER_NOTE=""
+  [ -e "$SITE_CONF" ] || return 0
+  # there but unreadable: an error, never the neutral values -- they would
+  # keep this user's state apart from everyone else's
+  [ -r "$SITE_CONF" ] || err 00001 "cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $(id -un)"
+  # shellcheck disable=SC1090  # the site file's path is a variable (tests point it elsewhere)
+  . "$SITE_CONF" || err 00002 "'$SITE_CONF' failed to load"
+}
+
+# The site's search directory accepts both spellings: .conf first, then bare.
+config_search_paths() {
+  [ -z "$CONFIG_SEARCH_DIR" ] || printf '%s\n' "$CONFIG_SEARCH_DIR/my-scan.conf" "$CONFIG_SEARCH_DIR/my-scan"
+  printf '%s\n' "$HOME/.my-scan.conf" /etc/my-scan.conf /usr/local/etc/my-scan.conf
+}
+
+# The offer names only paths the search reads, most common place first: the
+# site's offer directory -- only where the site's search directory is
+# searched, which a file there reaches as the note says; never the search
+# directory itself, a farm -- then /etc, then ~.
+config_offer_paths() {
+  if [ -n "$CONFIG_OFFER_DIR" ] && [ -n "$CONFIG_SEARCH_DIR" ]; then _p "$CONFIG_OFFER_DIR/my-scan.conf"; fi
+  for _o in /etc/my-scan.conf "$HOME/.my-scan.conf"; do
+    config_search_paths | grep -qx "$_o" && _p "$_o"
+  done
+}
+
+# "no config found": each offered place a paste-ready line, the site's note
+# beside its own place.
+no_config_offer() {
+  _p "!!! no config found -- write one, most common place first:"
+  config_offer_paths | while IFS= read -r _o; do
+    if [ "$_o" = "$CONFIG_OFFER_DIR/my-scan.conf" ] && [ -n "$CONFIG_OFFER_NOTE" ]; then
+      _p "    > $US --create-config > $_o   ($CONFIG_OFFER_NOTE)"
+    else
+      _p "    > $US --create-config > $_o"
+    fi
+  done
+  _p "    (--help: the full search order)"
 }
 
 load_config() {
+  read_site
   CONFIG_SOURCE=
 
   if [ -n "$MY_SCAN_CONFIG" ]; then
@@ -471,7 +514,7 @@ load_config() {
     CONFIG_FILE="$CONFIG"; CONFIG_SOURCE="--config"
   else
     CONFIG_FILE=""
-    _tmp="$(config_search_list)"
+    _tmp="$(config_search_paths)"
     while IFS= read -r _cand; do
       [ -z "$_cand" ] && continue
       if [ -r "$_cand" ]; then CONFIG_FILE="$_cand"; CONFIG_SOURCE="search"; break; fi
@@ -481,20 +524,17 @@ _EOCS_
   fi
 
   if [ -z "$CONFIG_FILE" ]; then
-    _p "No config file found. Searched, in order:" 1>&2
-    indent "$(config_search_list)" "    > " 1>&2
-    _p "" 1>&2
-    _p "Create one with:  $US --create-config /LINKS/default/my-scan" 1>&2
+    no_config_offer 1>&2
     exit 2
   fi
-  [ -r "$CONFIG_FILE" ] || err 00001 "Config file '$CONFIG_FILE' is not readable."
+  [ -r "$CONFIG_FILE" ] || err 00003 "Config file '$CONFIG_FILE' is not readable."
 
   # POSIX '.' SEARCHES $PATH when the operand contains no slash, so a config
   # named on the command line as a bare filename would be looked for in $PATH
   # and not found. Make it unambiguously a path.
   case "$CONFIG_FILE" in */*) _cf="$CONFIG_FILE";; *) _cf="./$CONFIG_FILE";; esac
   # shellcheck disable=SC1090  # path is resolved at runtime by the search above
-  . "$_cf" || err 00002 "FAILED to source config file '$CONFIG_FILE'."
+  . "$_cf" || err 00004 "FAILED to source config file '$CONFIG_FILE'."
   dbg "config: '$CONFIG_FILE' (via $CONFIG_SOURCE)"
 
   [ -n "$NO_LOG" ] && LOG=""
@@ -529,7 +569,7 @@ validate_config() {
   done
 
   [ -z "$_missing" ] && return 0
-  err 00003 "Config '$CONFIG_FILE' is missing or malformed:$_missing
+  err 00005 "Config '$CONFIG_FILE' is missing or malformed:$_missing
 --> It was probably written for an older version. Compare it against a fresh
     default:  $US --create-config | diff - '$CONFIG_FILE'"
 }
@@ -539,9 +579,9 @@ do_create_config() {
     _default_config_content
     return 0
   fi
-  [ -e "$CREATE_CONFIG_FILE" ] && err 00004 "Refusing to overwrite existing '$CREATE_CONFIG_FILE'."
+  [ -e "$CREATE_CONFIG_FILE" ] && err 00006 "Refusing to overwrite existing '$CREATE_CONFIG_FILE'."
   _default_config_content >"$CREATE_CONFIG_FILE" \
-    || err 00005 "FAILED to write '$CREATE_CONFIG_FILE'."
+    || err 00007 "FAILED to write '$CREATE_CONFIG_FILE'."
   msg "Wrote default config to '$CREATE_CONFIG_FILE'"
   det "edit it before use: DROP_PATHS and PART1_S_PATH still say CHANGEME"
   return 0
@@ -615,28 +655,28 @@ do_version() {
 }
 
 do_stamp_version() {
-  _dir="$(cd "$(dirname "$0")" && pwd)" || err 00006 "Cannot resolve own directory."
+  _dir="$(cd "$(dirname "$0")" && pwd)" || err 00008 "Cannot resolve own directory."
   git -C "$_dir" rev-parse --git-dir >/dev/null 2>&1 \
-    || err 00007 "Not inside a git checkout -- nothing to stamp."
+    || err 00009 "Not inside a git checkout -- nothing to stamp."
 
   # refuse when any OTHER file is dirty: the --amend would swallow it
   _other="$(git -C "$_dir" status --porcelain -- . | grep -v " $US\$" | grep -v "/$US\$")"
   [ -n "$_other" ] && { indent "$_other" "    > " 1>&2
-                        err 00008 "Other files are dirty; commit or stash them first."; }
+                        err 00010 "Other files are dirty; commit or stash them first."; }
 
   # refuse to amend an already-published commit
   if git -C "$_dir" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
     git -C "$_dir" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null \
-      && err 00009 "HEAD is already pushed -- amending it would rewrite published history."
+      && err 00011 "HEAD is already pushed -- amending it would rewrite published history."
   fi
 
   # The repo may be SHARED -- other sessions commit here too -- and an amend
   # rewrites whatever HEAD happens to be. Stamp only the commit that carries
   # THIS file: if HEAD does not touch it, HEAD is somebody else's work.
   [ -n "$(git -C "$_dir" show --name-only --format= HEAD -- "$US" 2>/dev/null)" ] \
-    || err 00010 "HEAD does not touch this file -- it is not this file's commit (commit it first; in a shared repo the amend would rewrite someone else's)."
+    || err 00012 "HEAD does not touch this file -- it is not this file's commit (commit it first; in a shared repo the amend would rewrite someone else's)."
 
-  _sha="$(git -C "$_dir" rev-parse --short HEAD)" || err 00011 "git rev-parse HEAD failed."
+  _sha="$(git -C "$_dir" rev-parse --short HEAD)" || err 00013 "git rev-parse HEAD failed."
   if [ "$SCRIPT_COMMIT" = "$_sha" ]; then
     msg "Already stamped with commit $_sha -- nothing to do."
     return 0
@@ -649,19 +689,19 @@ do_stamp_version() {
   sed -e "s|^SCRIPT_COMMIT=\".*\"|SCRIPT_COMMIT=\"$_sha\"|" \
       -e "s|^SCRIPT_RELEASE=\".*\"|SCRIPT_RELEASE=\"$_desc\"|" \
       -e "s|^SCRIPT_PARENT=\".*\"|SCRIPT_PARENT=\"$_par\"|" "$0" >"$_tmp" \
-    || { rm -f "$_tmp"; err 00012 "FAILED to rewrite SCRIPT_COMMIT."; }
+    || { rm -f "$_tmp"; err 00014 "FAILED to rewrite SCRIPT_COMMIT."; }
   grep -q "^SCRIPT_COMMIT=\"$_sha\"" "$_tmp" \
-    || { rm -f "$_tmp"; err 00013 "SCRIPT_COMMIT line not found -- refusing to install."; }
+    || { rm -f "$_tmp"; err 00015 "SCRIPT_COMMIT line not found -- refusing to install."; }
   grep -q "^SCRIPT_PARENT=\"$_par\"" "$_tmp" \
-    || { rm -f "$_tmp"; err 00014 "SCRIPT_PARENT line not found -- refusing to install."; }
+    || { rm -f "$_tmp"; err 00016 "SCRIPT_PARENT line not found -- refusing to install."; }
 
   _mode="$(/usr/bin/stat -f '%Lp' "$0")" || _mode=750
   if ! { chmod "$_mode" "$_tmp" && mv -f "$_tmp" "$0"; }; then
-    rm -f "$_tmp"; err 00015 "FAILED to install."
+    rm -f "$_tmp"; err 00017 "FAILED to install."
   fi
 
-  run git -C "$_dir" add -- "$US" || err 00016 "git add failed."
-  run git -C "$_dir" commit --amend --no-edit || err 00017 "git commit --amend failed."
+  run git -C "$_dir" add -- "$US" || err 00018 "git add failed."
+  run git -C "$_dir" commit --amend --no-edit || err 00019 "git commit --amend failed."
 
   msg "Stamped $US with commit $_sha, release ${_desc:-<no tag yet>} [$(build_id)]"
   det "the stamped sha lags HEAD by one: amending changes the sha. That is expected;"
@@ -700,7 +740,7 @@ find_lsof() {
   # An explicitly configured path that does not work is a mistake worth
   # naming, not something to quietly paper over by finding another one.
   if [ -n "$c_lsof" ] && [ -z "$LSOF_WARNED" ]; then
-    err 00018 "c_lsof '$c_lsof' is not executable -- searching the usual places instead." "-"
+    err 00020 "c_lsof '$c_lsof' is not executable -- searching the usual places instead." "-"
   fi
 
   for _c in $SETTLE_LSOF_SEARCH; do
@@ -710,7 +750,7 @@ find_lsof() {
   { [ -n "$c_lsof" ] && [ -x "$c_lsof" ]; } && return 0
   if [ -z "$LSOF_WARNED" ]; then
     LSOF_WARNED=1
-    err 00019 "lsof not found on $MY_OS -- the SMB/FTP writer check is DISABLED.
+    err 00021 "lsof not found on $MY_OS -- the SMB/FTP writer check is DISABLED.
 Settling now rests on size-stability and the parse check alone, which is
 weaker. Install lsof, or set c_lsof in the config." "-"
   fi
@@ -746,7 +786,7 @@ settle_writer_busy() { # $1 = file. 0 = a writer still holds it.
     # never silently: an unusable writer check means the size-stability and
     # parse checks are carrying this file on their own
     SETTLE_WRITER_CHECKED=0
-    err 00020 "lsof did not answer within ${SETTLE_LSOF_TIMEOUT}s for '$1' -- \
+    err 00022 "lsof did not answer within ${SETTLE_LSOF_TIMEOUT}s for '$1' -- \
 skipping the writer check, relying on size-stability and parse" "-"
     return 1
   fi
@@ -852,7 +892,7 @@ settle_file() { # $1 = file. 0 = settled, 1 = timed out.
           if [ "$_giveup" -gt 0 ] && [ "$SETTLE_WRITER_CHECKED" = "1" ] \
              && [ "$_unparse" -ge "$_giveup" ]; then
             SETTLE_REASON="no writer holds it and its size is steady, but it does not parse -- damaged, not still arriving"
-            err 00021 "GAVE UP after ${_unparse}s on '$_f' -- $SETTLE_REASON" "-"
+            err 00023 "GAVE UP after ${_unparse}s on '$_f' -- $SETTLE_REASON" "-"
             return 1
           fi ;;
         *) _unparse=0; _unp_t0="" ;;
@@ -870,7 +910,7 @@ settle_file() { # $1 = file. 0 = settled, 1 = timed out.
     _i=$(( $(date +%s) - _t0 ))
   done
 
-  err 00022 "TIMEOUT [${SETTLE_TIMEOUT}s] settling '$_f' -- $SETTLE_REASON" "-"
+  err 00024 "TIMEOUT [${SETTLE_TIMEOUT}s] settling '$_f' -- $SETTLE_REASON" "-"
   return 1
 }
 
@@ -911,8 +951,8 @@ settle_backup() { # $1 = file
   [ -n "$SETTLE_BACKUP_PATH" ] || return 0
   [ -n "$DRY_RUN" ] && { vdet "WOULD back up the raw delivery to '$SETTLE_BACKUP_PATH/'"; return 0; }
   _bkp="$SETTLE_BACKUP_PATH/$(date +"%Y-%m-%d_%H%M.%S")___$$"
-  mkdir -p "$_bkp" || { err 00023 "FAILED to create backup dir '$_bkp'" "-"; return 1; }
-  run rsync -axSH "$1" "$_bkp/" || { err 00024 "FAILED to back up '$1' to '$_bkp/'" "-"; return 1; }
+  mkdir -p "$_bkp" || { err 00025 "FAILED to create backup dir '$_bkp'" "-"; return 1; }
+  run rsync -axSH "$1" "$_bkp/" || { err 00026 "FAILED to back up '$1' to '$_bkp/'" "-"; return 1; }
   vdet "kept a copy of the raw delivery in '$_bkp/'"
   return 0
 }
@@ -935,8 +975,8 @@ determine_T_INP() { # sets T_INP from $INP / $S_INP / $T_PATH
       _inp="$_tmp"
     fi
     _mtime="$(file_mtime "$S_INP")"
-    [ -z "$_mtime" ] && err 00025 "Could not read the mtime of '$S_INP' on $MY_OS."
-    _newdate="$(date -r "$_mtime" +"%Y-%m-%d_%H%M.%S")" || err 00026 "date -r '$_mtime' failed."
+    [ -z "$_mtime" ] && err 00027 "Could not read the mtime of '$S_INP' on $MY_OS."
+    _newdate="$(date -r "$_mtime" +"%Y-%m-%d_%H%M.%S")" || err 00028 "date -r '$_mtime' failed."
     ddbg "mtime $_mtime -> '$_newdate'"
     _inp="${_newdate}___${_inp}"
   fi
@@ -959,7 +999,7 @@ determine_T_INP() { # sets T_INP from $INP / $S_INP / $T_PATH
       [ ! -e "$T_INP" ] && break
     done
   fi
-  [ -e "$T_INP" ] && err 00027 "Unable to determine a free T_INP for '$_inp'."
+  [ -e "$T_INP" ] && err 00029 "Unable to determine a free T_INP for '$_inp'."
 
   pe "  >  Determined T_INP as '$T_INP'."
 }
@@ -1042,7 +1082,7 @@ stage_lock_acquire() {
     _sl_i=$(( _sl_i + 1 ))
     [ "$_sl_i" -eq 1 ] && pe " >>> another '$US process' is staging (${_sl_o:-unknown}) -- waiting..."
     if [ "$_sl_i" -gt "$STAGE_LOCK_TIMEOUT" ]; then
-      err 00028 "TIMEOUT [${_sl_i}s] waiting for the staging lock '$_sl_d' (held by ${_sl_o:-unknown})." "-"
+      err 00030 "TIMEOUT [${_sl_i}s] waiting for the staging lock '$_sl_d' (held by ${_sl_o:-unknown})." "-"
       return 1
     fi
     sleep 1
@@ -1104,7 +1144,7 @@ find_pdfinfo() {
   { [ -n "$c_pdfinfo" ] && [ -x "$c_pdfinfo" ]; } && return 0
   if [ -n "$c_pdfinfo" ] && [ -z "$PDFINFO_WARNED" ]; then
     PDFINFO_WARNED=1
-    err 00029 "c_pdfinfo '$c_pdfinfo' is not executable -- searching the usual places instead." "-"
+    err 00031 "c_pdfinfo '$c_pdfinfo' is not executable -- searching the usual places instead." "-"
   fi
   # ONE list: the config's if it has one, the built-in only as its default.
   # Appending the built-in unconditionally made PDFINFO_SEARCH impossible to
@@ -1117,7 +1157,7 @@ find_pdfinfo() {
   { [ -n "$c_pdfinfo" ] && [ -x "$c_pdfinfo" ]; } && return 0
   if [ -z "$PDFINFO_WARNED" ]; then
     PDFINFO_WARNED=1
-    err 00030 "pdfinfo not found -- page counts and the parses check are UNAVAILABLE.
+    err 00032 "pdfinfo not found -- page counts and the parses check are UNAVAILABLE.
 Without it every readable PDF looks damaged, which is worse than saying so.
 Install it (brew install poppler), or set c_pdfinfo in the config." "-"
   fi
@@ -1128,7 +1168,7 @@ find_qpdf() {
   { [ -n "$c_qpdf" ] && [ -x "$c_qpdf" ]; } && return 0
   if [ -n "$c_qpdf" ] && [ -z "$QPDF_WARNED" ]; then
     QPDF_WARNED=1
-    err 00031 "c_qpdf '$c_qpdf' is not executable -- searching the usual places instead." "-"
+    err 00033 "c_qpdf '$c_qpdf' is not executable -- searching the usual places instead." "-"
   fi
   # ONE list, as for pdfinfo: the config's, or the built-in as its default.
   # shellcheck disable=SC2086  # deliberate: the list is words, not one path
@@ -1141,7 +1181,7 @@ find_qpdf() {
     QPDF_WARNED=1
     # LOUD, not a -V detail: a gate you believe is running but is not is worse
     # than no gate, because it buys confidence that nothing is backing.
-    err 00032 "qpdf not found -- the deep structural check is DISABLED.
+    err 00034 "qpdf not found -- the deep structural check is DISABLED.
 A delivery whose CONTENT was damaged in transit will pass settle and be OCRed.
 Install qpdf (brew install qpdf), or set c_qpdf in the config." "-"
   fi
@@ -1366,7 +1406,7 @@ file_ocred_results() { # $1 = newline-separated staged paths
       pe "  >  filed '$_fr_final'"
       file_by_rules "$_fr_final"
     else
-      err 00033 "FAILED [$?] to file '$_fr_f' -> '$_fr_final'" "-"
+      err 00035 "FAILED [$?] to file '$_fr_f' -> '$_fr_final'" "-"
     fi
   done <<_EOFI_
 $1
@@ -1428,7 +1468,7 @@ _EOCH_
   if [ "$_oc_rc" -eq 0 ]; then
     pe "  >  $MY_OCR finished [0]"
   else
-    err 00034 "$MY_OCR failed [$_oc_rc] -- see its own log; files it could not OCR are in '$T_PATH_FAILED'." "-"
+    err 00036 "$MY_OCR failed [$_oc_rc] -- see its own log; files it could not OCR are in '$T_PATH_FAILED'." "-"
   fi
   file_ocred_results "$_chunk"
   return 0
@@ -1443,7 +1483,7 @@ _EOCH_
 # judgement, and you get to disagree with it.
 do_cleanup_unrecoverable() {
   _cu_dirs="$T_PATH_FAILED $OCR_QUEUE_PATH"
-  _cu_t="$(mktemp /tmp/my-scan.cleanup.XXXXXX)" || err 00035 "mktemp failed."
+  _cu_t="$(mktemp /tmp/my-scan.cleanup.XXXXXX)" || err 00037 "mktemp failed."
   for _cu_d in $_cu_dirs; do
     [ -d "$_cu_d" ] || continue
     candidate_files "$_cu_d" | sort | while IFS= read -r _cu_f; do
@@ -1479,7 +1519,7 @@ do_cleanup_unrecoverable() {
     rm -f "$_cu_t"; return 0
   fi
 
-  [ -x "$c_trash" ] || { rm -f "$_cu_t"; err 00036 "NOT FOUND: '$c_trash' -- refusing to delete outright."; }
+  [ -x "$c_trash" ] || { rm -f "$_cu_t"; err 00038 "NOT FOUND: '$c_trash' -- refusing to delete outright."; }
   _cu_done=0
   while IFS="$TAB" read -r _cu_w _cu_f; do
     [ -n "$_cu_f" ] || continue
@@ -1552,13 +1592,13 @@ ocr_types() {
 }
 
 do_process() {
-  [ -x "$c_trash" ]   || err 00037 "NOT FOUND: '$c_trash' (brew install trash)"
-  find_pdfinfo       || err 00038 "NOT FOUND: pdfinfo (brew install poppler) -- every gate reads its page count."
-  [ -x "$MY_OCR" ]    || err 00039 "NOT FOUND: '$MY_OCR' -- my-scan hands every OCR to it."
+  [ -x "$c_trash" ]   || err 00039 "NOT FOUND: '$c_trash' (brew install trash)"
+  find_pdfinfo       || err 00040 "NOT FOUND: pdfinfo (brew install poppler) -- every gate reads its page count."
+  [ -x "$MY_OCR" ]    || err 00041 "NOT FOUND: '$MY_OCR' -- my-scan hands every OCR to it."
   # A missing my-docs must not stop the OCR: the scans are still OCRed and
   # filed in T_PATH_DONE, only not by the rules -- said once, then off.
   if [ -n "$MY_DOCS" ] && [ ! -x "$MY_DOCS" ]; then
-    err 00040 "NOT FOUND: MY_DOCS='$MY_DOCS' -- scans stay in '$T_PATH_DONE', unfiled by the rules; MY_DOCS=\"\" turns this off." "-"
+    err 00042 "NOT FOUND: MY_DOCS='$MY_DOCS' -- scans stay in '$T_PATH_DONE', unfiled by the rules; MY_DOCS=\"\" turns this off." "-"
     MY_DOCS=""
   fi
 
@@ -1630,7 +1670,7 @@ do_process() {
     # asked once per run, BEFORE anything is claimed: a type my-ocr does not
     # take is filed under FAILED here, rather than staged to fail there
     OCR_TYPES="$(ocr_types)" || { stage_lock_release
-      err 00041 "'$MY_OCR --status' names no TYPES, so my-scan cannot tell which files my-ocr takes -- nothing was taken; update my-ocr, then '$US process --all'."; }
+      err 00043 "'$MY_OCR --status' names no TYPES, so my-scan cannot tell which files my-ocr takes -- nothing was taken; update my-ocr, then '$US process --all'."; }
   fi
 
   if [ -n "$PROCESS_ALL" ]; then
@@ -1669,7 +1709,7 @@ do_process() {
     [ -z "$S_INP" ] && continue
     pe ""
     pe " >>> '$S_INP'"
-    [ -e "$S_INP" ] || { err 00042 "File '$S_INP' not found." "-"; continue; }
+    [ -e "$S_INP" ] || { err 00044 "File '$S_INP' not found." "-"; continue; }
 
     INP="${S_INP##*/}"
 
@@ -1679,7 +1719,7 @@ do_process() {
       T_PATH="$T_PATH_FAILED"; stage_file
       T_PATH="$OCR_QUEUE_PATH"
       notify_bad_delivery "$S_INP" "incomplete -- it never settled within ${SETTLE_TIMEOUT}s (${SETTLE_REASON:-unknown})"
-      err 00043 "'$S_INP' never settled within ${SETTLE_TIMEOUT}s -- filed under FAILED." "-"
+      err 00045 "'$S_INP' never settled within ${SETTLE_TIMEOUT}s -- filed under FAILED." "-"
       continue
     fi
     pe "  >  settled ($(file_size "$S_INP") bytes) [0]"
@@ -1693,7 +1733,7 @@ do_process() {
       T_PATH="$T_PATH_FAILED"; stage_file
       T_PATH="$OCR_QUEUE_PATH"
       notify_bad_delivery "$S_INP" "structurally damaged -- $DEEP_CHECK_WHY"
-      err 00044 "'$S_INP' is structurally damaged ($DEEP_CHECK_WHY) -- filed under FAILED." "-"
+      err 00046 "'$S_INP' is structurally damaged ($DEEP_CHECK_WHY) -- filed under FAILED." "-"
       continue
     fi
     settle_backup "$S_INP"
@@ -1715,7 +1755,7 @@ do_process() {
         empty*) notify_bad_delivery "$S_INP" "EMPTY (0 bytes)" ;;
         *)      notify_bad_delivery "$S_INP" "unreadable -- '$INP_FILE_TYPE', not a document my-ocr can OCR" ;;
       esac
-      err 00045 "Unexpected file type '$INP_FILE_TYPE' -- filed under FAILED." "-"
+      err 00047 "Unexpected file type '$INP_FILE_TYPE' -- filed under FAILED." "-"
       continue
     fi
     pe "  >  type '$INP_FILE_TYPE' PASSED"
@@ -1912,8 +1952,8 @@ do_scan() {
   _be="$(scan_backend)"
   case "$_be" in
     scanimage) : ;;
-    "")        err 00046 "No scan backend at all: 'scanimage' is not installed and SCAN_DEVICE '$SCAN_DEVICE' names no recognised backend. Install one with 'brew install sane-backends', then '$US devices'." ;;
-    *)         err 00047 "SCAN_DEVICE '$SCAN_DEVICE' selects the '$_be' backend, which is not implemented yet -- only 'scanimage' is. Install it with 'brew install sane-backends'." ;;
+    "")        err 00048 "No scan backend at all: 'scanimage' is not installed and SCAN_DEVICE '$SCAN_DEVICE' names no recognised backend. Install one with 'brew install sane-backends', then '$US devices'." ;;
+    *)         err 00049 "SCAN_DEVICE '$SCAN_DEVICE' selects the '$_be' backend, which is not implemented yet -- only 'scanimage' is. Install it with 'brew install sane-backends'." ;;
   esac
 
   if [ -n "$1" ]; then fn="$1"; shift; else fn="$SCAN_DEFAULT_FNAME"; fi
@@ -1924,7 +1964,7 @@ do_scan() {
   SCAN_BATCH_FILENAME="${TEMPFILE_PREFIX}%d.$SCAN_FORMAT"
   SCAN_OPTS="$SCAN_DEFAULT_OPTS --mode $SCAN_MODE --resolution ${SCAN_DPI}dpi $*"
 
-  cd "$SCAN_OUT_PATH" || err 00048 "Cannot cd to SCAN_OUT_PATH '$SCAN_OUT_PATH'."
+  cd "$SCAN_OUT_PATH" || err 00050 "Cannot cd to SCAN_OUT_PATH '$SCAN_OUT_PATH'."
 
   msg "Scanning '$SCAN_DEVICE_NAME' to '$fn' in '$SCAN_OUT_PATH'"
   det "options: $SCAN_OPTS"
@@ -1954,11 +1994,11 @@ do_scan() {
   fi
 
   [ "$rc" -ne 4 ] && [ "$rc" -ne 0 ] \
-    && err 00049 "Scan failed [$rc]: $SCAN_CMDSTR  (pwd '$(pwd)')"
+    && err 00051 "Scan failed [$rc]: $SCAN_CMDSTR  (pwd '$(pwd)')"
 
   msg2 "Assembling the pages into '$fn'"
   run "$c_convert" "$SCAN_OUT_PATH/$TEMPFILE_PREFIX"* "$full_fn" \
-    || err 00050 "FAILED to assemble '$SCAN_OUT_PATH/$TEMPFILE_PREFIX'* into '$full_fn'."
+    || err 00052 "FAILED to assemble '$SCAN_OUT_PATH/$TEMPFILE_PREFIX'* into '$full_fn'."
 
   scan_cleanup
 
@@ -1966,7 +2006,7 @@ do_scan() {
     # deliberately word-split: it is a command WITH arguments ("open -a Preview")
     # shellcheck disable=SC2086
     run $SCAN_VIEWER_CMD "$full_fn" \
-      || err 00051 "FAILED [$?] to open '$full_fn' with '$SCAN_VIEWER_CMD'." "-"
+      || err 00053 "FAILED [$?] to open '$full_fn' with '$SCAN_VIEWER_CMD'." "-"
   else
     vdet "SCAN_VIEWER_CMD is empty -- not opening '$full_fn'"
   fi
@@ -2061,8 +2101,8 @@ do_watch_status() {
   # my-ocr is only consulted when the OCR queue is non-empty -- that is the
   # only time the answer can differ, and it is a process spawn per poll.
   OCR_STATE="queued for OCR"
-  _ws_prev="$(mktemp /tmp/my-scan.w1.XXXXXX)" || err 00052 "mktemp failed."
-  _ws_cur="$(mktemp /tmp/my-scan.w2.XXXXXX)"  || err 00053 "mktemp failed."
+  _ws_prev="$(mktemp /tmp/my-scan.w1.XXXXXX)" || err 00054 "mktemp failed."
+  _ws_cur="$(mktemp /tmp/my-scan.w2.XXXXXX)"  || err 00055 "mktemp failed."
   # shellcheck disable=SC2064  # expand the paths now, not at trap time
   trap "rm -f '$_ws_prev' '$_ws_cur'; echo; exit 0" INT TERM HUP
 
@@ -2291,7 +2331,7 @@ do_cancel() {
     OCR_STATE="OCRing"
   fi
 
-  _tmp="$(mktemp /tmp/my-scan.cancel.XXXXXX)" || err 00054 "mktemp failed."
+  _tmp="$(mktemp /tmp/my-scan.cancel.XXXXXX)" || err 00056 "mktemp failed."
   cancel_list > "$_tmp"
   _n="$(awk 'NF{n++} END{print n+0}' "$_tmp" 2>/dev/null)"
 
@@ -2327,7 +2367,7 @@ do_cancel() {
       case "$_ans" in y|Y|yes|YES) ;; *) det "aborted."; rm -f "$_tmp"; return 0;; esac
     else
       rm -f "$_tmp"
-      err 00055 "'--all' needs confirmation and there is no terminal to ask. Add --yes."
+      err 00057 "'--all' needs confirmation and there is no terminal to ask. Add --yes."
     fi
   fi
 
@@ -2350,7 +2390,7 @@ do_cancel() {
       msg2 "cancelled: '${_f##*/}' -> '$T_PATH_FAILED/'"
       [ "$_st" = "OCRing" ] && det "its OCR is still running -- '$US reset' stops the machinery"
     else
-      err 00056 "FAILED [$?] to move '$_f' to '$T_PATH_FAILED/'" "-"
+      err 00058 "FAILED [$?] to move '$_f' to '$T_PATH_FAILED/'" "-"
     fi
   done < "$_tmp"
   rm -f "$_tmp"
@@ -2606,7 +2646,7 @@ setup_write_workflow() {
   case "$WORKFLOW_SHELL" in
     /bin/bash|/bin/csh|/bin/ksh|/bin/sh|/bin/tcsh|/bin/zsh) ;;
     /usr/bin/perl|/usr/bin/ruby|/usr/local/bin/python|/usr/local/bin/python3) ;;
-    *) err 00057 "WORKFLOW_SHELL '$WORKFLOW_SHELL' is not one Automator accepts. \
+    *) err 00059 "WORKFLOW_SHELL '$WORKFLOW_SHELL' is not one Automator accepts. \
 Its Run Shell Script step silently does nothing with any other shell -- no error, \
 nothing in any log. Use one of: /bin/zsh /bin/sh /bin/bash /bin/ksh /bin/csh /bin/tcsh." "-"
        return 1 ;;
@@ -2628,7 +2668,7 @@ nothing in any log. Use one of: /bin/zsh /bin/sh /bin/bash /bin/ksh /bin/csh /bi
   if [ -d "$_wf" ]; then
     _bak="$_wf.bak-$(date -u +%Y%m%dT%H%M%SZ)"
     if [ -n "$DRY_RUN" ]; then det "WOULD BACK UP the existing workflow to '$_bak'"
-    else run cp -R "$_wf" "$_bak" || { err 00058 "FAILED to back up '$_wf'" "-"; return 1; }
+    else run cp -R "$_wf" "$_bak" || { err 00060 "FAILED to back up '$_wf'" "-"; return 1; }
          det "backed the existing workflow up to '$_bak'"; fi
   fi
 
@@ -2648,7 +2688,7 @@ nothing in any log. Use one of: /bin/zsh /bin/sh /bin/bash /bin/ksh /bin/csh /bi
     return 0
   fi
 
-  mkdir -p "$_wf/Contents" || { err 00059 "FAILED to create '$_wf/Contents'" "-"; return 1; }
+  mkdir -p "$_wf/Contents" || { err 00061 "FAILED to create '$_wf/Contents'" "-"; return 1; }
 
   cat >"$_wf/Contents/Info.plist" <<_EOIP_
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2734,14 +2774,14 @@ _EOPY_
   _rc=$?
   if [ "$_rc" -ne 0 ]; then
     # the generator's own diagnosis, never a bare exit code
-    err 00060 "FAILED [$_rc] to generate '$_doc': $(tail -n 3 "$_gerr" | tr '\n' ' ')" "-"
+    err 00062 "FAILED [$_rc] to generate '$_doc': $(tail -n 3 "$_gerr" | tr '\n' ' ')" "-"
     rm -f "$_gerr"; return 1
   fi
   rm -f "$_gerr"
 
   # verify what was written rather than trusting the generator
   /usr/bin/plutil -lint "$_doc" >/dev/null 2>&1 \
-    || { err 00061 "'$_doc' is not a valid plist." "-"; return 1; }
+    || { err 00063 "'$_doc' is not a valid plist." "-"; return 1; }
   _steps="$(/usr/bin/plutil -extract actions raw -o - "$_doc" 2>/dev/null)"
   det "wrote a $_steps-step workflow, plist lints clean [0]"
   return 0
@@ -3008,7 +3048,7 @@ do_uninstall() {
 
   _gui="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
   if [ "$(id -u)" = "0" ]; then
-    err 00062 "Run '$US uninstall' as the GUI user, not as root.
+    err 00064 "Run '$US uninstall' as the GUI user, not as root.
 The Folder Action belongs to the caller's login session; as root you would be
 detaching root's, not '${_gui:-the console user}'s.
 Try:   su - ${_gui:-<the console user>} -c '$US uninstall${1:+ $1}'"
@@ -3096,14 +3136,14 @@ do_setup() {
   # like it worked -- it even used to print "for GUI user 'root'".
   _gui="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
   if [ "$(id -u)" = "0" ]; then
-    err 00063 "Run '$US setup' as the GUI user, not as root.
+    err 00065 "Run '$US setup' as the GUI user, not as root.
 It writes into \$HOME (here: '$HOME') and binds the Folder Action in the
 caller's login session -- as root, both would be root's and no scan would
 ever reach it.
 Try:   su - ${_gui:-<the console user>} -c '$US setup${1:+ $1}'"
   fi
   if [ -n "$_gui" ] && [ "$_gui" != "$(id -un)" ]; then
-    err 00064 "You are '$(id -un)' but the console (GUI) user is '$_gui'.
+    err 00066 "You are '$(id -un)' but the console (GUI) user is '$_gui'.
 The Folder Action has to belong to the user whose session the scans arrive in,
 so this would set it up for the wrong account." "-"
     det "continuing anyway -- but check the bindings it reports at the end"
@@ -4106,6 +4146,79 @@ rt_config_keys() {
   esac
 }
 
+# The site file: its values when it is there, the neutral ones when it is
+# not -- an exported variable never in their place -- an error when it is
+# there but unreadable; the search reads its directory first, both names, the
+# default LOG and PAGE_CACHE lie under its bases, and the offer names its
+# offer directory with the note, never the farm.
+rt_site_conf() {
+  _d="$T_TMP/site"; t_world "$_d"; mkdir -p -- "$_d/farm"
+  _sc="$_d/site.conf"
+  _o=$( (SITE_CONF="$_sc"; DATA_BASE_DIR=/elsewhere; export DATA_BASE_DIR; read_site
+         printf '%s|%s|%s' "$DATA_BASE_DIR" "$LOG_BASE_DIR" "$CONFIG_SEARCH_DIR") 2>&1)
+  if [ "$_o" = "/var/db|/var/log|" ]; then t_ok "without the site file: /var/db, /var/log, no search directory"
+  else t_bad "without the site file: /var/db, /var/log, no search directory" "'$_o'"; fi
+
+  printf '%s\n' 'DATA_BASE_DIR="/srv/data"' 'LOG_BASE_DIR="/srv/log"' "CONFIG_SEARCH_DIR=\"$_d/farm\"" \
+    "CONFIG_OFFER_DIR=\"$_d/global\"" 'CONFIG_OFFER_NOTE="linked there by a run"' >"$_sc"
+  # the bare name in the farm, with the default's own LOG and PAGE_CACHE lines
+  { grep -v -e '^LOG=' -e '^PAGE_CACHE=' "$T_CONF"
+    "$0" --create-config 2>/dev/null | grep -e '^LOG=' -e '^PAGE_CACHE='; } >"$_d/farm/my-scan"
+  _o=$( (SITE_CONF="$_sc"; MY_SCAN_CONFIG=""; CONFIG=""; NO_LOG=""; load_config
+         printf '%s|%s|%s' "$CONFIG_FILE" "$LOG" "$PAGE_CACHE") 2>&1)
+  _w="$(/usr/bin/whoami)"
+  if [ "$_o" = "$_d/farm/my-scan|/srv/log/$_w/my-scan.log|/srv/data/$_w/my-scan.pagecache" ]; then
+    t_ok "with the site file: its search directory (bare name), LOG and PAGE_CACHE under its bases"
+  else t_bad "with the site file: its search directory (bare name), LOG and PAGE_CACHE under its bases" "'$_o'"; fi
+
+  _o=$( (SITE_CONF="$_sc"; read_site; no_config_offer) 2>&1)
+  case "$_o" in
+    *"> $US --create-config > $_d/farm/"*) t_bad "the offer names the site's offer directory with its note, never the farm" "offered the farm: '$_o'" ;;
+    *"    > $US --create-config > $_d/global/my-scan.conf   (linked there by a run)"*"/etc/my-scan.conf"*)
+       t_ok "the offer names the site's offer directory with its note, never the farm" ;;
+    *) t_bad "the offer names the site's offer directory with its note, never the farm" "'$_o'" ;;
+  esac
+
+  chmod 000 "$_sc"
+  _o=$( (SITE_CONF="$_sc"; read_site) 2>&1); _rc=$?
+  chmod 600 "$_sc"
+  case "$_rc|$_o" in
+    1"|"*"ERROR $(t_code "cannot read '\$SITE_CONF'") "*"cannot read '$_sc'"*)
+       t_ok "a site file there but unreadable is an error, never the neutral values" ;;
+    *) t_bad "a site file there but unreadable is an error, never the neutral values" "rc $_rc '$_o'" ;;
+  esac
+}
+
+# Every offered path is searched, or is the site's offer directory while the
+# site's search directory is searched; the search directory itself, a farm,
+# is never offered.
+rt_config_offer() {
+  _d="$T_TMP/offer"; mkdir -p -- "$_d"
+  _sc="$_d/site.conf"
+  printf '%s\n' "CONFIG_SEARCH_DIR=\"$_d/farm\"" "CONFIG_OFFER_DIR=\"$_d/global\"" >"$_sc"
+  _bad=""
+  for _with in site offer-only none; do
+    # offer-only: an offer directory with no search directory -- a file
+    # written there would be read from nowhere, so it is not offered
+    [ "$_with" = offer-only ] && printf '%s\n' "CONFIG_OFFER_DIR=\"$_d/global\"" >"$_sc"
+    [ "$_with" = none ] && rm -f "$_sc"
+    # shellcheck disable=SC2030  # deliberate: the test's own site file, in this subshell only
+    _bad="$_bad$( (SITE_CONF="$_sc"; read_site
+      while IFS= read -r _o; do
+        case "$_o" in
+          "$_d/farm/"*) printf ' %s(the farm)' "$_o" ;;
+          "$_d/global/my-scan.conf") config_search_paths | grep -qx "$_d/farm/my-scan.conf" || printf ' %s' "$_o" ;;
+          *) config_search_paths | grep -qx "$_o" || printf ' %s' "$_o" ;;
+        esac
+      done <<_EOF
+$(config_offer_paths)
+_EOF
+      [ "$_with" != site ] || config_offer_paths | grep -qx "$_d/global/my-scan.conf" || printf ' (site offer missing)') 2>&1)"
+  done
+  if [ -z "$_bad" ]; then t_ok "the config offer names only searched paths, never the farm"
+  else t_bad "the config offer names only searched paths, never the farm" "offered but not searched:$_bad"; fi
+}
+
 # The gate shipped INERT on a host that had qpdf, because the config predated
 # c_qpdf and an unset path was read as "skip the check".
 rt_pdfinfo_autodetect() {
@@ -4646,7 +4759,7 @@ _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
   concurrent_process workflow fa_bound status_folder_action status_engine fa_live partial_delivery deep_check cleanup batching
   picture_input types_from_my_ocr my_ocr_types status_order retry listing_not_swallowed_by_log
   reset_delegates test_mail help_claims opt_arg_not_subcommand quiet
-  counts_add_up failed_are_counted my_docs dry_run dry_run_retry dry_run_summary config_keys qpdf_autodetect
+  counts_add_up failed_are_counted my_docs dry_run dry_run_retry dry_run_summary config_keys site_conf config_offer qpdf_autodetect
   pdfinfo_autodetect settle_giveup settle_clock version_clone ignored_inputs
   err_codes run_list_complete"
 
@@ -4742,11 +4855,11 @@ do_run_tests() { # $1 = optional FILTER
 do_test_mail() {
   case ",$NOTIFY_VIA," in
     *,mail,*) ;;
-    *) err 00065 "mail is off in '$CONFIG_FILE': NOTIFY_VIA='$NOTIFY_VIA' has no 'mail'." ;;
+    *) err 00067 "mail is off in '$CONFIG_FILE': NOTIFY_VIA='$NOTIFY_VIA' has no 'mail'." ;;
   esac
   command -v notify_mail >/dev/null 2>&1 \
-    || err 00066 "'$CONFIG_FILE' defines no notify_mail() -- it predates it; regenerate it from --create-config."
-  [ -x "$my_notify" ] || err 00067 "my_notify='$my_notify' is not executable."
+    || err 00068 "'$CONFIG_FILE' defines no notify_mail() -- it predates it; regenerate it from --create-config."
+  [ -x "$my_notify" ] || err 00069 "my_notify='$my_notify' is not executable."
 
   _tm_to="${NOTIFY_MAIL_TO:-the my-notify default recipient}"
   _tm_body="This is a test mail from '$US --test-mail'. It went out through
@@ -4760,7 +4873,7 @@ Version: $(do_version)"
 
   notify_mail "$US test mail" "$_tm_body"
   _tm_rc=$?
-  [ "$_tm_rc" -eq 0 ] || err 00068 "test mail to $_tm_to NOT sent [my-notify rc $_tm_rc]"
+  [ "$_tm_rc" -eq 0 ] || err 00070 "test mail to $_tm_to NOT sent [my-notify rc $_tm_rc]"
   msg "test mail sent to $_tm_to [my-notify rc $_tm_rc]"
   return 0
 }
@@ -4770,6 +4883,7 @@ Version: $(do_version)"
 #### USAGE
 
 usage() {
+# shellcheck disable=SC2031  # SITE_CONF is changed only inside the tests' subshells
 cat <<_EOU_
 usage: $US [OPTIONAL] <MANDATORY> parameters.
 
@@ -4837,8 +4951,13 @@ SETTLE:
 
 CONFIG:
   Searched in this order, first existing wins:
-    \$MY_SCAN_CONFIG, --config <FILE>, /LINKS/default/my-scan,
-    ~/.my-scan.conf, /etc/my-scan.conf, /usr/local/etc/my-scan.conf
+    \$MY_SCAN_CONFIG, --config <FILE>, \$CONFIG_SEARCH_DIR/my-scan.conf, then
+    \$CONFIG_SEARCH_DIR/my-scan, ~/.my-scan.conf, /etc/my-scan.conf,
+    /usr/local/etc/my-scan.conf
+  $SITE_CONF, when there, is read first: the site's
+  CONFIG_SEARCH_DIR, and LOG_BASE_DIR / DATA_BASE_DIR, under which the
+  default LOG and PAGE_CACHE lie (/var/log, /var/db without the file).
+  There but unreadable: an error.
 
 EXAMPLES:
   $US                                     print this usage
@@ -4908,7 +5027,7 @@ while [ $# -gt 0 ]; do
     -w|--wait)           WAIT_FOR_ADF=1 ;;
     -d|--duplex)         WAIT_FOR_ADF=1; DUPLEX=1 ;;
     -g|--grey|--gray)    SCAN_MODE_OVERRIDE="Gray" ;;
-    -r|--resolution)     isInt "$1" || err 00069 "--resolution needs an integer, got '$1'."
+    -r|--resolution)     isInt "$1" || err 00071 "--resolution needs an integer, got '$1'."
                          SCAN_DPI_OVERRIDE="$1"; shift ;;
     --all)               CANCEL_ALL=1; RESET_ALL=1; PROCESS_ALL=1 ;;
     --retry)             PROCESS_RETRY="queue"
@@ -4950,7 +5069,7 @@ load_config
 # break every invocation of a tool whose main job has nothing to do with it.
 if [ -n "$WATCH_INTERVAL_OVERRIDE" ]; then
   isNum "$WATCH_INTERVAL_OVERRIDE" \
-    || err 00070 "--watch interval '$WATCH_INTERVAL_OVERRIDE' is not a positive number."
+    || err 00072 "--watch interval '$WATCH_INTERVAL_OVERRIDE' is not a positive number."
   WATCH_INTERVAL="$WATCH_INTERVAL_OVERRIDE"
 fi
 
@@ -4984,7 +5103,7 @@ case "${WHAT:-usage}" in
   cancel)   do_cancel "$@";  RC=$? ;;
   reset)    do_reset;        RC=$? ;;
   devices)  do_devices;       RC=$? ;;
-  *)        err 00071 "Unknown subcommand '$WHAT'. See --help." ;;
+  *)        err 00073 "Unknown subcommand '$WHAT'. See --help." ;;
 esac
 
 # the subcommand's verdict is the tool's exit status -- a caller that pipes

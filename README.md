@@ -63,7 +63,7 @@ my-docs is its own ERROR line in the log. `MY_DOCS=""` turns step 6 off.
 |---|---|---|
 | owns | receiving a scan: settle, name, file | OCR: the engine, the mutex |
 | Folder Action | the scanner's drop folder | none -- my-scan calls it |
-| config | `/LINKS/default/my-scan` | its own |
+| config | `my-scan.conf` (see Configuration) | its own |
 
 They meet at one point: my-scan runs `my-ocr <files>`, and my-ocr knows
 nothing about scanners.
@@ -100,7 +100,7 @@ with the other two checks rather than skipping the writer check in silence.
 ## status
 
 ```
-CONFIG    /LINKS/default/my-scan (via search)
+CONFIG    /etc/my-scan.conf (via search)
 VERSION   my-scan v2.0 (commit a1b2c3d, build 171071b2c1ae)
 SCANNER   CHANGEME (http://…/eSCL)  not answering (normally off) [2]
 DROP      ftp  .../ftp/in/scans      3 waiting
@@ -377,17 +377,32 @@ Settle: `--settle-timeout <SEC>`.
 One file, searched in order, first existing wins:
 
 ```
-$MY_SCAN_CONFIG,  --config <FILE>,  /LINKS/default/my-scan,
+$MY_SCAN_CONFIG,  --config <FILE>,
+$CONFIG_SEARCH_DIR/my-scan.conf,  $CONFIG_SEARCH_DIR/my-scan,
 ~/.my-scan.conf,  /etc/my-scan.conf,  /usr/local/etc/my-scan.conf
 ```
+
+`/LINKS/default/site.conf`, when it exists, is read first -- plain
+`KEY="value"` lines, the one site-specific path in my-scan:
+
+| key | without the file | my-scan uses it as |
+|---|---|---|
+| `CONFIG_SEARCH_DIR` | not searched | searched for `my-scan.conf`, then `my-scan` |
+| `CONFIG_OFFER_DIR`, `CONFIG_OFFER_NOTE` | not offered | where "no config found" offers one, the note beside it |
+| `LOG_BASE_DIR` | `/var/log` | the default `LOG`: `<base>/<user>/my-scan.log` |
+| `DATA_BASE_DIR` | `/var/db` | the default `PAGE_CACHE`: `<base>/<user>/my-scan.pagecache` |
+
+There but unreadable is an error, never the fallback. A key the config sets
+wins over the site's value.
 
 No behaviour default lives in the script — the only place they exist is the
 text `--create-config` emits. The config is validated as it loads: a key that
 is missing or not a number is named and refused, because an empty numeric
-bound would otherwise turn a wait loop into a spin. After an upgrade:
+bound would otherwise turn a wait loop into a spin. After an upgrade, compare
+it with the file `status` names on its `CONFIG` line:
 
 ```sh
-my-scan --create-config | diff - /LINKS/default/my-scan
+my-scan --create-config | diff - <that file>
 ```
 
 | | |
