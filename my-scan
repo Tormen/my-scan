@@ -11,15 +11,15 @@
 # 00073 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="939fe42"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="9f396d8"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.1-24-g939fe42"
+SCRIPT_RELEASE="v1.1-25-g9f396d8"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="0dccae9"
+SCRIPT_PARENT="425c1f6"
 
 US="${0##*/}"
 SITE_CONF="/LINKS/default/site.conf"   # the ONE site path in this tool: read_site
@@ -457,6 +457,22 @@ c_lsof_opts="-b -w -n -P"
 _EOCONF_
 }
 
+# sh: 0 not there, 1 there ([ -r ] it: unreadable is the error), 2 cannot tell
+site_absent() {
+	_sa_p=$1
+	[ -e "$_sa_p" ] && return 1
+	[ -L "$_sa_p" ] && return 2
+	while :; do
+		_sa_d=$(dirname -- "$_sa_p")
+		[ "$_sa_d" = "$_sa_p" ] && return 0
+		if [ -e "$_sa_d" ] || [ -L "$_sa_d" ]; then
+			[ -d "$_sa_d" ] && [ -x "$_sa_d" ] && return 0
+			return 2
+		fi
+		_sa_p=$_sa_d
+	done
+}
+
 # The site's values for every tool, from SITE_CONF -- the one site path this
 # tool knows -- read before its own config: the base directories, where a
 # config is searched and where one is offered. The neutral values first, so
@@ -465,10 +481,12 @@ _EOCONF_
 read_site() {
   DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"
   CONFIG_SEARCH_DIR=""; CONFIG_OFFER_DIR=""; CONFIG_OFFER_NOTE=""
-  [ -e "$SITE_CONF" ] || return 0
-  # there but unreadable: an error, never the neutral values -- they would
-  # keep this user's state apart from everyone else's
-  [ -r "$SITE_CONF" ] || err 00001 "cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $(id -un)"
+  site_absent "$SITE_CONF" && return 0
+  # there but unreadable, or cannot tell (a link to nothing, a folder on the
+  # way it cannot search -- then [ -r ] fails too): an error, never the
+  # neutral values -- they would keep this user's state apart from everyone
+  # else's
+  [ -r "$SITE_CONF" ] || err 00001 "cannot read '$SITE_CONF' (unreadable, a link to nothing, or a folder on the way it cannot search) -- the site's directories for every tool; its group must include $(id -un)"
   # shellcheck disable=SC1090  # the site file's path is a variable (tests point it elsewhere)
   . "$SITE_CONF" || err 00002 "'$SITE_CONF' failed to load"
 }
@@ -4203,6 +4221,27 @@ rt_site_conf() {
   esac
 }
 
+# The site file behind a folder it cannot search, or a link to nothing: an
+# error, never the neutral values -- [ -e ] alone answers "not there" for
+# both. Plainly not there: the neutral values.
+rt_site_cannot_tell() {
+  _d="$T_TMP/site-cannot-tell"; mkdir -p -- "$_d/shut"
+  printf '%s\n' 'DATA_BASE_DIR="/srv/data"' >"$_d/shut/site.conf"
+  ln -s "$_d/nowhere" "$_d/dangling.conf"; chmod 000 "$_d/shut"
+  for _c in shut/site.conf dangling.conf; do
+    _o=$( (SITE_CONF="$_d/$_c"; read_site; echo "went on with the neutral values") 2>&1); _rc=$?
+    case "$_rc|$_o" in
+      1"|"*"ERROR $(t_code "cannot read '\$SITE_CONF'") "*"cannot read '$_d/$_c'"*)
+         t_ok "a site file $_c (cannot tell it is there) is an error, never the neutral values" ;;
+      *) t_bad "a site file $_c (cannot tell it is there) is an error, never the neutral values" "rc $_rc '$_o'" ;;
+    esac
+  done
+  chmod 700 "$_d/shut"
+  _o=$( (SITE_CONF="$_d/absent/site.conf"; read_site; printf '%s|%s' "$LOG_BASE_DIR" "$CONFIG_SEARCH_DIR") 2>&1)
+  if [ "$_o" = "/var/log|" ]; then t_ok "a site file plainly not there: the neutral values"
+  else t_bad "a site file plainly not there: the neutral values" "'$_o'"; fi
+}
+
 # Every offered path is searched, or is the site's offer directory while the
 # site's search directory is searched; the search directory itself, a farm,
 # is never offered.
@@ -4801,7 +4840,7 @@ _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
   concurrent_process workflow fa_bound status_folder_action osa_session status_engine fa_live partial_delivery deep_check cleanup batching
   picture_input types_from_my_ocr my_ocr_types status_order retry listing_not_swallowed_by_log
   reset_delegates test_mail help_claims opt_arg_not_subcommand quiet
-  counts_add_up failed_are_counted my_docs dry_run dry_run_retry dry_run_summary config_keys site_conf config_offer qpdf_autodetect
+  counts_add_up failed_are_counted my_docs dry_run dry_run_retry dry_run_summary config_keys site_conf site_cannot_tell config_offer qpdf_autodetect
   pdfinfo_autodetect settle_giveup settle_clock version_clone ignored_inputs
   err_codes run_list_complete"
 
