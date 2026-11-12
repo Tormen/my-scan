@@ -11,15 +11,15 @@
 # 00073 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="f37a18c"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="939fe42"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.1-23-gf37a18c"
+SCRIPT_RELEASE="v1.1-24-g939fe42"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="ab18a66"
+SCRIPT_PARENT="0dccae9"
 
 US="${0##*/}"
 SITE_CONF="/LINKS/default/site.conf"   # the ONE site path in this tool: read_site
@@ -2826,11 +2826,18 @@ osa_run() {
 
 # Can a consent dialog actually be answered from here? Automation permission is
 # granted per CALLING application, and the prompt is drawn in the console user's
-# GUI session. From ssh there is nobody to click it.
+# GUI session. From ssh there is nobody to click it; from a LaunchDaemon, or a
+# 'su -l' it starts, there is no GUI session to draw it in -- the console user's
+# name is no proof, the session (launchd's 'Aqua') is. OSA_WHY says which.
 osa_can_prompt() {
-  [ -n "$SSH_CONNECTION$SSH_TTY$SSH_CLIENT" ] && return 1
-  [ "$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)" = "$(id -un)" ] || return 1
-  return 0
+  OSA_WHY=""
+  if [ -n "$SSH_CONNECTION$SSH_TTY$SSH_CLIENT" ]; then OSA_WHY="this is an ssh session"
+  elif [ "$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)" != "$(id -un)" ]; then
+    OSA_WHY="the console user is $(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
+  elif _osa_s="$(launchctl managername 2>/dev/null)"; [ "$_osa_s" != "Aqua" ]; then
+    OSA_WHY="not in the GUI session (launchd session '${_osa_s:-unknown}')"
+  fi
+  [ -z "$OSA_WHY" ]
 }
 
 # Resolve a directory to its physical path. System Events stores the RESOLVED
@@ -2930,7 +2937,7 @@ setup_attach() {
     if ! osa_can_prompt; then
       det "NOTE: macOS may now ask '...wants access to control System Events'"
       det "      ON THE CONSOLE of $(hostname -s) -- go there and click Allow."
-      det "      (you are not at that console: $( [ -n "$SSH_CONNECTION$SSH_TTY$SSH_CLIENT" ] && echo "this is an ssh session" || echo "console user is $(/usr/bin/stat -f%Su /dev/console 2>/dev/null)" ))"
+      det "      (you are not at that console: $OSA_WHY)"
     fi
     osa_run <<_EOAS_
 tell application "System Events"
@@ -3484,6 +3491,13 @@ rt_concurrent_process() {
 
 # ---- the workflow Automator has to accept --------------------------------
 rt_workflow() {
+  # 'setup go' attaches a REAL Folder Action through System Events; where it
+  # cannot be asked, every call waits out OSASCRIPT_TIMEOUT and the suite its
+  # whole time limit
+  if ! osa_can_prompt; then
+    t_ok "workflow: skipped, System Events cannot be asked from here: $OSA_WHY"
+    return 0
+  fi
   _d="$T_TMP/wflow"; t_world "$_d"
   "$0" --config "$T_CONF" setup go >/dev/null 2>&1 </dev/null
   _doc="$T_WFDIR/my-scan.workflow/Contents/document.wflow"
@@ -4256,7 +4270,7 @@ rt_pdfinfo_autodetect() {
     *) t_bad "-V status lists a sound PDF as ok with c_pdfinfo unset" "got '$_o3'";;
   esac
   # ...and the classifier never calls a file broken without pdfinfo to ask
-  # shellcheck disable=SC2123  # deliberate, as above: ONLY pdfinfo is gone
+  # shellcheck disable=SC2123,SC2030  # deliberate, as above: ONLY pdfinfo is gone, in this subshell only
   _o4="$( c_pdfinfo="/nonexistent/pdfinfo"; PDFINFO_SEARCH="/nonexistent/pdfinfo"
           PATH="/usr/bin:/bin"; PDFINFO_WARNED=""; classify_file "$_d/a.pdf" 2>/dev/null )"
   case "$_o4" in
@@ -4325,19 +4339,22 @@ rt_settle_giveup() {
 # 41s, and every writer check waited a full second for an lsof that answers
 # in 0.03s.
 rt_settle_clock() {
-  # (a) the writer check returns when lsof does, not on the next whole second
-  if find_lsof; then
-    printf 'x' >"$T_TMP/quiet.pdf"
-    _t0="$(date +%s)"
-    for _n in 1 2 3 4 5; do settle_writer_busy "$T_TMP/quiet.pdf"; done
-    _el=$(( $(date +%s) - _t0 ))
-    if [ "$_el" -lt 3 ]; then
-      t_ok "settle: five writer checks take ${_el}s, not a second each"
-    else
-      t_bad "settle: five writer checks take under 3s" "took ${_el}s -- each waits out a whole second"
-    fi
+  # (a) the writer check returns when lsof does, not on the next whole second.
+  # A stub lsof answering in 0.2s, so the clock measures the check and not how
+  # fast the real lsof is on a loaded machine (12 suites at once took 7s for
+  # five real checks). Waiting out whole seconds makes ten checks at least
+  # 10s; returning with lsof makes them ~2s.
+  printf '#!/bin/dash\nsleep 0.2\n' >"$T_TMP/lsof.quick"; chmod +x "$T_TMP/lsof.quick"
+  printf 'x' >"$T_TMP/quiet.pdf"
+  _t0="$(date +%s)"
+  # shellcheck disable=SC2030  # deliberate: the stub and the bound, in this subshell only
+  ( c_lsof="$T_TMP/lsof.quick"; SETTLE_LSOF_TIMEOUT=10
+    for _n in 1 2 3 4 5 6 7 8 9 10; do settle_writer_busy "$T_TMP/quiet.pdf"; done )
+  _el=$(( $(date +%s) - _t0 ))
+  if [ "$_el" -lt 10 ]; then
+    t_ok "settle: ten writer checks take ${_el}s, not a second each"
   else
-    t_ok "settle: no lsof here -- the writer-check timing is skipped"
+    t_bad "settle: ten writer checks take under 10s" "took ${_el}s -- each waits out a whole second"
   fi
 
   # (b) a slow check counts against SETTLE_TIMEOUT: an lsof that takes 3s,
@@ -4656,6 +4673,31 @@ rt_status_folder_action() {
   esac
 }
 
+# A suite run from a LaunchDaemon (su -l to the console user) passed the old
+# check -- not ssh, the console user's name -- and every System Events call
+# then waited out OSASCRIPT_TIMEOUT. The session decides, not the name.
+rt_osa_session() {
+  _sd="$T_TMP/osa-session"; mkdir -p -- "$_sd"
+  _osa_case() { # $1 = what the stub launchctl answers
+    printf '#!/bin/dash\necho %s\n' "$1" >"$_sd/launchctl"; chmod +x "$_sd/launchctl"
+    # shellcheck disable=SC2030,SC2031  # deliberate: the stub on PATH, in this subshell only
+    ( PATH="$_sd:$PATH"; SSH_CONNECTION=""; SSH_TTY=""; SSH_CLIENT=""
+      osa_can_prompt; printf '%s|%s' "$?" "$OSA_WHY" )
+  }
+  _o="$(_osa_case System)"
+  case "$_o" in
+    "1|not in the GUI session (launchd session 'System')") t_ok "osa: outside the GUI session, System Events is not asked [1]";;
+    *) t_bad "osa: outside the GUI session, System Events is not asked" "'$_o'";;
+  esac
+  if [ "$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)" = "$(id -un)" ]; then
+    _o="$(_osa_case Aqua)"
+    if [ "$_o" = "0|" ]; then t_ok "osa: the console user's GUI session can be asked [0]"
+    else t_bad "osa: the console user's GUI session can be asked" "'$_o'"; fi
+  else
+    t_ok "osa: not the console user here -- the GUI-session case is skipped"
+  fi
+}
+
 # status named the OCR application itself (OCRAPP FineReader ...), so an
 # engine change broke it. The engine lines are my-ocr's, verbatim.
 rt_status_engine() {
@@ -4686,7 +4728,7 @@ rt_status_engine() {
 # goes to the Trash through the tool's own 'uninstall go'.
 t_fa_live_attach() { # $1 config, $2 folder, $3 workflow name, $4 workflow dir, $5 label
   if ! osa_can_prompt; then
-    t_ok "$5: skipped, no GUI session here (ssh, or not the console user) -- System Events cannot be asked"
+    t_ok "$5: skipped, System Events cannot be asked from here: $OSA_WHY"
     return 0
   fi
   _fl_log="$T_TMP/fa-live.$$.log"
@@ -4756,7 +4798,7 @@ rt_run_list_complete() {
 # "not ok K - name" as each test ends -- in parallel, so in any order (see
 # do_run_tests) -- and "# <seconds>s <name>" after it.
 _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
-  concurrent_process workflow fa_bound status_folder_action status_engine fa_live partial_delivery deep_check cleanup batching
+  concurrent_process workflow fa_bound status_folder_action osa_session status_engine fa_live partial_delivery deep_check cleanup batching
   picture_input types_from_my_ocr my_ocr_types status_order retry listing_not_swallowed_by_log
   reset_delegates test_mail help_claims opt_arg_not_subcommand quiet
   counts_add_up failed_are_counted my_docs dry_run dry_run_retry dry_run_summary config_keys site_conf config_offer qpdf_autodetect
