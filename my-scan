@@ -11,15 +11,15 @@
 # 00073 == highest used errCode
 
 SCRIPT_VERSION="v1.1"
-SCRIPT_COMMIT="9f396d8"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
+SCRIPT_COMMIT="20137d3"   # rewritten by 'my-scan stamp-version'; authoritative at runtime
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v1.1-25-g9f396d8"
+SCRIPT_RELEASE="v1.1-26-g20137d3"
 # The commit the stamped one sits on. SCRIPT_COMMIT itself is never pushed --
 # the amend replaces it -- so no other clone has it; its parent is always
 # there, and that is what proves a repository is this tool's own.
-SCRIPT_PARENT="425c1f6"
+SCRIPT_PARENT="2ea8882"
 
 US="${0##*/}"
 SITE_CONF="/LINKS/default/site.conf"   # the ONE site path in this tool: read_site
@@ -458,19 +458,16 @@ _EOCONF_
 }
 
 # sh: 0 not there, 1 there ([ -r ] it: unreadable is the error), 2 cannot tell
+# Judged by the system's own answer, never by mode bits: macOS can refuse a
+# look the bits allow (TCC). On 2, _sa_m says why, for the error message.
 site_absent() {
-	_sa_p=$1
-	[ -e "$_sa_p" ] && return 1
-	[ -L "$_sa_p" ] && return 2
-	while :; do
-		_sa_d=$(dirname -- "$_sa_p")
-		[ "$_sa_d" = "$_sa_p" ] && return 0
-		if [ -e "$_sa_d" ] || [ -L "$_sa_d" ]; then
-			[ -d "$_sa_d" ] && [ -x "$_sa_d" ] && return 0
-			return 2
-		fi
-		_sa_p=$_sa_d
-	done
+	[ -e "$1" ] && return 1
+	_sa_m=$(LC_ALL=C ls -d -- "$1" 2>&1 > /dev/null)
+	case $_sa_m in *": No such file or directory") return 0 ;; esac
+	if [ -n "$_sa_m" ]; then _sa_m="the system says: ${_sa_m##*: }"
+	elif [ -L "$1" ]; then _sa_m="a link to nothing"
+	else _sa_m="listed, but it cannot be looked at"; fi
+	return 2
 }
 
 # The site's values for every tool, from SITE_CONF -- the one site path this
@@ -4241,6 +4238,19 @@ rt_site_cannot_tell() {
   if [ "$_o" = "/var/log|" ]; then t_ok "a site file plainly not there: the neutral values"
   else t_bad "a site file plainly not there: the neutral values" "'$_o'"; fi
 }
+# a look the system refuses although the mode bits allow it (macOS TCC): an
+# error, never the neutral values; ls stands in for the kernel's answer
+rt_site_refused() {
+  _d="$T_TMP/site-refused"; mkdir -- "$_d" "$_d/refused" "$_d/fakebin"
+  # shellcheck disable=SC2016  # $3 belongs to the fake ls, expanded when it runs
+  printf '#!/bin/dash\necho "ls: $3: Operation not permitted" >&2\nexit 1\n' >"$_d/fakebin/ls"; chmod 755 "$_d/fakebin/ls"
+  _o=$( (SITE_CONF="$_d/refused/site.conf"; PATH="$_d/fakebin:/usr/bin:/bin" read_site; echo "went on with the neutral values") 2>&1); _rc=$?
+  case "$_rc|$_o" in
+    1"|"*"ERROR $(t_code "cannot read '\$SITE_CONF'") "*"cannot read '$_d/refused/site.conf'"*)
+       t_ok "a site file the system refuses to look at, whatever the mode bits, is an error -- never the neutral values" ;;
+    *) t_bad "a site file the system refuses to look at, whatever the mode bits, is an error -- never the neutral values" "rc $_rc '$_o'" ;;
+  esac
+}
 
 # Every offered path is searched, or is the site's offer directory while the
 # site's search directory is searched; the search directory itself, a farm,
@@ -4840,7 +4850,7 @@ _rt_all="stage_inputs stage_settle stage_staging stage_batch stage_failure
   concurrent_process workflow fa_bound status_folder_action osa_session status_engine fa_live partial_delivery deep_check cleanup batching
   picture_input types_from_my_ocr my_ocr_types status_order retry listing_not_swallowed_by_log
   reset_delegates test_mail help_claims opt_arg_not_subcommand quiet
-  counts_add_up failed_are_counted my_docs dry_run dry_run_retry dry_run_summary config_keys site_conf site_cannot_tell config_offer qpdf_autodetect
+  counts_add_up failed_are_counted my_docs dry_run dry_run_retry dry_run_summary config_keys site_conf site_cannot_tell site_refused config_offer qpdf_autodetect
   pdfinfo_autodetect settle_giveup settle_clock version_clone ignored_inputs
   err_codes run_list_complete"
 
